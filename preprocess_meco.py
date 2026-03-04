@@ -46,13 +46,19 @@ class MECO_L1_Preprocessor:
         w1 = w1[common_cols]
         w2 = w2[common_cols]
         df = pd.concat([w1, w2], ignore_index=True)
-        df['unique_trial_id'] = df['subid'].astype(str) + '_' + df['trialid'].astype(str)
+        df['unique_sentence_id'] = (
+                df['subid'].astype(str)
+                + '_'
+                + df['trialid'].astype(str)
+                + '_'
+                + df['sentnum'].astype(str)
+        )
         return df
 
     def compute_features(self, df):
         # Sort by time
-        df = df.sort_values(['unique_trial_id', 'start']).reset_index(drop=True)
-        grouped = df.groupby('unique_trial_id')
+        df = df.sort_values(['unique_sentence_id', 'start']).reset_index(drop=True)
+        grouped = df.groupby('unique_sentence_id')
 
         # Fixation index
         df['fix_index'] = grouped.cumcount() + 1
@@ -62,9 +68,9 @@ class MECO_L1_Preprocessor:
             df['ianum_local'] = grouped['ianum'].transform(lambda x: pd.factorize(x)[0] + 1)
             df['ianum_norm'] = grouped['ianum_local'].transform(lambda x: x / x.max())
 
-        # Trial-level
-        df['trial_ia_count'] = grouped['unique_trial_id'].transform('count')
-        df['paragraph_rt'] = grouped['dur'].transform('sum')
+        # Sentence-level aggregates
+        df['sentence_fix_count'] = grouped['dur'].transform('count')
+        df['sentence_rt'] = grouped['dur'].transform('sum')
         df['ia_dwell_pct'] = grouped['dur'].transform(lambda x: x / x.sum())
 
         return df
