@@ -1,112 +1,28 @@
+from model_definition import MECODataset, batch_precompute_embeddings, EyeExpertM, train_epoch
 import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader, Subset
-from transformers import XLMRobertaTokenizer
-from torch.utils.data import Dataset, DataLoader
-from model_definition import EyeXpertMModel
-from model_definition import MecoDataset
+import random
 
+# Load cached embeddings
+print("Loading cached embeddings...")
+all_samples = batch_precompute_embeddings([], cache_path="embeddings_cache.pkl")
 
-# -------------------------------------------------
-# 1. Load small subset
-# -------------------------------------------------
+# Shuffle and split
+random.shuffle(all_samples)
+n = len(all_samples)
+train_samples = all_samples[:int(0.8*n)]
+val_samples = all_samples[int(0.8*n):int(0.9*n)]
+test_samples = all_samples[int(0.9*n):]
 
-csv_path = "processed_data/meco_l1_en_processed.csv"
+train_dataset = MECODataset()
+train_dataset.samples = train_samples
 
-tokenizer = XLMRobertaTokenizer.from_pretrained("xlm-roberta-base")
-dataset = MecoDataset(csv_path, tokenizer)
+# Initialize model and optimizer
+model = EyeExpertM()
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
-# Take only first 10 trials
-small_indices = list(range(10))
-small_dataset = Subset(dataset, small_indices)
-
-def collate_fn_small(batch):
-    input_ids_list, attention_mask_list, fix_durs_list, word_map_list = zip(*batch)
-
-    input_ids = torch.stack(input_ids_list)
-    attention_mask = torch.stack(attention_mask_list)
-
-    # Dummy language IDs (single language test)
-    lang_ids = torch.zeros(len(batch), dtype=torch.long)
-
-    return input_ids, attention_mask, fix_durs_list, word_map_list, lang_ids
-
-
-dataloader = DataLoader(
-    small_dataset,
-    batch_size=2,
-    shuffle=True,
-    collate_fn=collate_fn_small
-)
-
-# -------------------------------------------------
-# 2. Initialize model (small + frozen)
-# -------------------------------------------------
-
-model = EyeXpertMModel(
-    num_languages=1,
-    num_experts=2,
-    freeze_bottom_layers=12  # freeze everything
-)
-
-# Freeze entire encoder for speed
-for param in model.encoder.parameters():
-    param.requires_grad = False
-
-device = torch.device("cpu")
-model.to(device)
-
-optimizer = torch.optim.Adam(
-    filter(lambda p: p.requires_grad, model.parameters()),
-    lr=1e-3
-)
-
-mse_loss = nn.MSELoss()
-
-# -------------------------------------------------
-# 3. Tiny Training Loop
-# -------------------------------------------------
-
-model.train()
-
-for epoch in range(20):
-    total_loss = 0
-
-    for input_ids, attention_mask, fix_durs_list, word_map_list, lang_ids in dataloader:
-
-        input_ids = input_ids.to(device)
-        attention_mask = attention_mask.to(device)
-        lang_ids = lang_ids.to(device)
-
-        optimizer.zero_grad()
-
-        _, dur_preds = model(
-            input_ids,
-            attention_mask,
-            word_map_list,
-            lang_ids
-        )
-
-        loss = 0
-
-        for pred_dur, target_dur in zip(dur_preds, fix_durs_list):
-
-            target_dur = target_dur.to(device)
-
-            # Trim to smallest length (important!)
-            min_len = min(len(pred_dur), len(target_dur))
-            pred_dur = pred_dur[:min_len]
-            target_dur = target_dur[:min_len]
-
-            # Log transform improves numerical stability
-            target_dur = torch.log1p(target_dur)
-
-            loss += mse_loss(pred_dur, target_dur)
-
-        loss.backward()
-        optimizer.step()
-
-        total_loss += loss.item()
-
-    print(f"Test Epoch Loss: {total_loss:.4f}")
-
+# Short training
+for epoch in range(3):
+    global_loss, expert_losses = train_epoch(model, train_dataset, optimizer, batch_size=8)
+    print(f"\nEpoch {epoch} — Global Avg Loss: {global_loss:.4f}")
+    for eid in sorted(expert_losses.keys()):
+        print(f"  Expert {eid} Avg Loss: {expert_losses[eid]:.4f}")
