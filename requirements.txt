@@ -1,0 +1,4 @@
+torch==2.7.0+cu121
+transformers==5.1.0
+pandas==2.2.3
+numpy==2.2.2
