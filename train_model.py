@@ -242,16 +242,18 @@ model = EyeExpertM(
     encoder_dim=768,
     n_experts=5,
     max_seq_len=embedding_size,
-    window_size=8
+    window_size=4,
+    n_layers=2,
+    attention_type='dot',
 ).to(device)
-optimizer = optim.Adam(model.parameters(), lr=1e-4)
-alpha = 0.5
+optimizer = optim.Adam(model.parameters(), lr=0.0003)
+alpha = 0.31
 
 # -------------------------------
 # Training loop
 # -------------------------------
-epochs = 1
-batch_size = 8
+epochs = 5
+batch_size = 16
 os.makedirs("checkpoints", exist_ok=True)
 
 for epoch in range(epochs):
