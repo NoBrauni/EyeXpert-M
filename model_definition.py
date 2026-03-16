@@ -72,8 +72,9 @@ class MECODataset:
                 continue
 
             # Normalize durations
+            dur_mean, dur_std = np.load("duration_stats.npy")
             dur_seq = np.array(dur_seq)
-            dur_seq = (dur_seq - dur_seq.mean()) / (dur_seq.std() + 1e-6)
+            dur_seq = (dur_seq - dur_mean) / (dur_std + 1e-6)
 
             self.samples.append(
                 {
