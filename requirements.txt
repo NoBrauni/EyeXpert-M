@@ -1,5 +1,9 @@
-torch==2.7.0+cu121
-transformers==5.1.0
-pandas==2.2.3
-numpy==2.2.2
-optuna>=3.5
+pyreadr~=0.5.4
+torch==2.4.1
+pandas~=2.2.3
+numpy==1.26.4
+rapidfuzz~=3.12.1
+sentencepiece>=0.1.96
+transformers==4.41.2
+tqdm>=4.66.0
+optuna>=3.6.0
