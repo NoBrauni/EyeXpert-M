@@ -171,7 +171,7 @@ def generate_universal_sentence_embeddings(
 # -------------------------------
 if __name__ == "__main__":
     generate_universal_sentence_embeddings(
-        pickle_dir="datasets",
+        pickle_dir="../datasets",
         cache_path="test_embeddings.pkl",
         batch_size=4,                   # small for CPU
         device=None,                     # auto detect GPU/CPU
