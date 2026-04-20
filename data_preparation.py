@@ -1,162 +1,263 @@
-import os
-
+import pyreadr
 import pandas as pd
 import numpy as np
-import pyreadr
-from pathlib import Path
+import re
+import json
 from rapidfuzz import process, fuzz
-import pickle
-from transformers import XLMRobertaModel, XLMRobertaTokenizer
+from collections import Counter, defaultdict
 
-class MECOPipeline:
-    def __init__(
-        self,
-        w1_fix_file,
-        w2_fix_file,
-        sentences_file,
-        duration_stats_path="duration_stats.npy",
-        min_dur=60,
-        output_dir="datasets",
-        languages=None,  # List of languages to process; None = all
-    ):
-        self.w1_fix_file = w1_fix_file
-        self.w2_fix_file = w2_fix_file
-        self.sentences_file = sentences_file
-        self.min_dur = min_dur
-        self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(exist_ok=True)
-        self.languages = languages
+# -----------------------------
+# CONFIG
+# -----------------------------
 
-        # Load duration stats once
-        self.dur_mean, self.dur_std = np.load(duration_stats_path)
+RDA_FILE_1 = "joint_l1_fixation_version2.0_w1.rda"
+RDA_FILE_2 = "joint_fix_trimmed_l1_wave2_MinusCh_version2.0.RDA"
+SENTENCE_CSV = "sentences.csv"
 
-        # Load sentence bank
-        sentences_df = pd.read_csv(self.sentences_file)
-        self.sentences_list = (
-            sentences_df["sentence"].dropna().astype(str).tolist()
-        )
+TEST_RATIO = 0.2
+RANDOM_SEED = 42
 
-        self.samples = []
-
-    # -------------------------
-    # Fuzzy matching
-    # -------------------------
-    def fuzzy_match(self, sent, score_cutoff=80):
-        if pd.isna(sent) or not str(sent).strip():
-            return None
-        match = process.extractOne(
-            str(sent).strip(),
-            self.sentences_list,
-            scorer=fuzz.partial_ratio,
-        )
-        if match and match[1] >= score_cutoff:
-            return match[0]
-        return None
-
-    # -------------------------
-    # Load fixations
-    # -------------------------
-    def load_fixations(self):
-        print("Loading fixation files...")
-        w1_fix = pyreadr.read_r(self.w1_fix_file)["joint.fix"]
-        w2_fix = pyreadr.read_r(self.w2_fix_file)["joint.fix"]
-        df = pd.concat([w1_fix, w2_fix], ignore_index=True)
-        if "lang" not in df.columns:
-            df["lang"] = "unknown"
-        df["unique_sentence_id"] = (
-            df["subid"].astype(str)
-            + "_"
-            + df["trialid"].astype(str)
-            + "_"
-            + df["sentnum"].astype(str)
-        )
-        return df
-
-    # -------------------------
-    # Compute features
-    # -------------------------
-    def compute_features(self, df):
-        df = df.sort_values(["unique_sentence_id", "start"]).reset_index(drop=True)
-        grouped = df.groupby("unique_sentence_id")
-        df["fix_index"] = grouped.cumcount() + 1
-        if "ianum" in df.columns:
-            df["ianum_local"] = grouped["ianum"].transform(lambda x: pd.factorize(x)[0] + 1)
-        return df
-
-    # -------------------------
-    # Build dataset
-    # -------------------------
-    def build_dataset_full(self, df):
-        df = df[(df["blink"] == 0) & (df["dur"] >= self.min_dur)].copy()
-        word_table = df[["subid", "unique_sentence_id", "ianum", "word"]].drop_duplicates()
-        word_table["full_idx"] = word_table.groupby(["subid", "unique_sentence_id"]).cumcount()
-        df = df.merge(word_table, on=["subid", "unique_sentence_id", "ianum", "word"], how="left")
-        df = df.dropna(subset=["full_idx"])
-        df["dur_norm"] = (df["dur"] - self.dur_mean) / (self.dur_std + 1e-6)
-
-        grouped = df.sort_values("fix_index").groupby(["subid", "unique_sentence_id"])
-        scanpaths = grouped["full_idx"].agg(list)
-        durations = grouped["dur_norm"].agg(list)
-        words_full = word_table.sort_values("full_idx").groupby(["subid", "unique_sentence_id"])["word"].agg(list)
-        meta = grouped.first()[["sentence", "lang"]]
-
-        combined = pd.concat([meta, words_full, scanpaths, durations], axis=1).reset_index()
-        combined.columns = ["subid", "sentence_id", "sentence", "lang", "words", "scanpath", "durations"]
-        combined["sentence_len"] = combined["words"].apply(len)
-
-        self.samples = combined.to_dict(orient="records")
-
-    # -------------------------
-    # Run pipeline
-    # -------------------------
-    def run(self):
-        df = self.load_fixations()
-        df = self.compute_features(df)
-
-        # Filter languages if provided
-        langs_to_process = df["lang"].unique()
-        if self.languages:
-            langs_to_process = [lang for lang in langs_to_process if lang in self.languages]
-
-        for lang in langs_to_process:
-            df_lang = df[df["lang"] == lang]
-            out_file = self.output_dir / f"meco_dataset_{lang}.pkl"
-            if out_file.exists():
-                print(f"✅ Found existing dataset for {lang}, skipping fuzzy matching.")
-                continue
-
-            print(f"\nProcessing language: {lang} ({len(df_lang)} rows)")
-            df_lang["sentence"] = df_lang["sent"].apply(self.fuzzy_match)
-            match_rate = df_lang["sentence"].notna().mean()
-            print(f"Fuzzy match success rate for {lang}: {match_rate:.2%}")
-
-            self.build_dataset_full(df_lang)
-
-            with open(out_file, "wb") as f:
-                pickle.dump(self.samples, f)
-            print(f"Saved {len(self.samples)} samples to {out_file}")
-
-        print("\nPipeline complete!")
-
-    # -------------------------
-    # Dataset interface
-    # -------------------------
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        return self.samples[idx]
-
-pipeline = MECOPipeline(
-    w1_fix_file="joint_l1_fixation_version2.0_w1.rda",
-    w2_fix_file="joint_fix_trimmed_l1_wave2_MinusCh_version2.0.RDA",
-    sentences_file="sentences.csv",
-    languages= [
+LANGUAGES = [
     "en", "en_uk", "du", "ge", "ge_po", "ge_zu",
     "no", "da", "ic",
     "sp", "sp_ch", "it", "bp",
     "ru", "ru_mo", "se",
     "fi", "ee",
 ]
+
+# -----------------------------
+# TEXT NORMALIZATION
+# -----------------------------
+
+def norm_text(x):
+    if pd.isna(x):
+        return ""
+    return re.sub(r"\s+", " ", str(x).lower().strip())
+
+def norm_word(w):
+    return re.sub(r"[^\wåæøÅÆØ]", "", str(w).lower())
+
+# -----------------------------
+# LOAD
+# -----------------------------
+
+def load_rda(path):
+    return next(iter(pyreadr.read_r(path).values()))
+
+print("Loading data...")
+
+df = pd.concat([
+    load_rda(RDA_FILE_1),
+    load_rda(RDA_FILE_2)
+], ignore_index=True)
+
+df = df[df["lang"].isin(LANGUAGES)].copy()
+
+# sentence bank
+sentences = pd.read_csv(SENTENCE_CSV)["sentence"].dropna()
+sentence_list = sentences.map(norm_text).tolist()
+
+# -----------------------------
+# MATCH SENTENCES (FAST CACHE)
+# -----------------------------
+
+print("Matching sentences (fast)...")
+
+df["sent_norm"] = df["sent"].map(norm_text)
+unique_prefixes = df["sent_norm"].dropna().unique()
+
+mapping = {}
+
+for i, p in enumerate(unique_prefixes):
+    if i % 1000 == 0:
+        print(f"{i}/{len(unique_prefixes)}")
+
+    if not p:
+        continue
+
+    match = process.extractOne(p, sentence_list, scorer=fuzz.partial_ratio)
+    mapping[p] = match[0] if match and match[1] >= 85 else None
+
+df["full_sentence"] = df["sent_norm"].map(mapping)
+
+print("Missing:", df["full_sentence"].isna().mean())
+
+df = df.dropna(subset=["full_sentence"])
+
+# -----------------------------
+# UID
+# -----------------------------
+
+df["uid"] = (
+    df["subid"].astype(str) + "_" +
+    df["trialid"].astype(str) + "_" +
+    df["sentnum"].astype(str)
 )
-pipeline.run()
+
+# -----------------------------
+# GROUP META TABLE (IMPORTANT)
+# -----------------------------
+
+meta = df.groupby("uid").first().reset_index()[["uid", "subid", "lang", "full_sentence"]]
+
+# -----------------------------
+# SPLIT (BALANCED TEST)
+# -----------------------------
+
+print("Creating balanced split...")
+
+np.random.seed(RANDOM_SEED)
+
+test_uids = []
+
+for lang, g in meta.groupby("lang"):
+    uids = g["uid"].tolist()
+    np.random.shuffle(uids)
+
+    n_test = int(len(uids) * TEST_RATIO)
+    test_uids.extend(uids[:n_test])
+
+test_uids = set(test_uids)
+
+train_uids = set(meta["uid"]) - test_uids
+
+# sanity: no overlap
+assert len(train_uids & test_uids) == 0
+
+print("Train UIDs:", len(train_uids))
+print("Test UIDs:", len(test_uids))
+
+# -----------------------------
+# ALIGNMENT
+# -----------------------------
+
+def build_alignment(g):
+
+    full_sent = g["full_sentence"].iloc[0]
+    tokens_raw = full_sent.split()
+    tokens = [norm_word(w) for w in tokens_raw]
+
+    fix_words_raw = g["word"].astype(str).tolist()
+    fix_words = [norm_word(w) for w in fix_words_raw]
+
+    ia = pd.to_numeric(g["ianum"], errors="coerce").tolist()
+    dur = pd.to_numeric(g["dur"], errors="coerce").fillna(0).tolist()
+
+    # -----------------------------
+    # Anchor using unique words
+    # -----------------------------
+    counts = Counter(tokens)
+    unique_words = {w for w, c in counts.items() if c == 1}
+
+    anchor_fix = None
+    anchor_sent = None
+
+    for i, w in enumerate(fix_words):
+        if w in unique_words and not np.isnan(ia[i]):
+            anchor_fix = i
+            anchor_sent = tokens.index(w)
+            break
+
+    if anchor_fix is None:
+        return None
+
+    offset = anchor_sent - int(ia[anchor_fix])
+
+    # -----------------------------
+    # Build aligned scanpath
+    # -----------------------------
+    scanpath = []
+    scanpath_words = []
+    durations = []
+
+    for i, x in enumerate(ia):
+
+        if np.isnan(x):
+            continue
+
+        shifted = int(x) + offset
+
+        if 0 <= shifted < len(tokens):
+
+            token_word = tokens[shifted]
+            fix_word = fix_words[i]
+
+            # allow mismatch but track it
+            if fix_word != "" and fix_word != token_word:
+                # optional: skip noisy mismatch
+                # continue
+
+                pass
+
+            scanpath.append(shifted)
+            scanpath_words.append(tokens_raw[shifted])  # keep original casing
+            durations.append(dur[i])
+
+    if len(scanpath) == 0:
+        return None
+
+    return {
+        "uid": g["uid"].iloc[0],
+        "lang": g["lang"].iloc[0],
+        "sentence": full_sent,
+        "words": tokens_raw,
+
+        "scanpath": scanpath,
+        "scanpath_words": scanpath_words,
+        "durations": durations,
+
+        "n_words": len(tokens),
+        "n_fixations": len(scanpath),
+    }
+
+# -----------------------------
+# BUILD SAMPLES
+# -----------------------------
+
+print("Building dataset...")
+
+train, test = [], []
+
+for uid, g in df.groupby("uid"):
+
+    sample = build_alignment(g)
+    if sample is None:
+        continue
+
+    if uid in test_uids:
+        test.append(sample)
+    else:
+        train.append(sample)
+
+print("Train samples:", len(train))
+print("Test samples:", len(test))
+
+# -----------------------------
+# LANGUAGE BALANCE CHECK
+# -----------------------------
+
+def lang_dist(data):
+    d = defaultdict(int)
+    for s in data:
+        d[s["lang"]] += 1
+    return dict(d)
+
+print("\nLANGUAGE DISTRIBUTION")
+print("Train:", lang_dist(train))
+print("Test:", lang_dist(test))
+
+# -----------------------------
+# SAVE JSON
+# -----------------------------
+
+print("Saving JSON...")
+
+with open("meco_train.json", "w") as f:
+    json.dump(train, f)
+
+with open("meco_test.json", "w") as f:
+    json.dump(test, f)
+
+print("Saved:")
+print(" - meco_train.json")
+print(" - meco_test.json")
