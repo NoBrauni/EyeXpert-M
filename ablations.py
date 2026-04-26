@@ -16,6 +16,15 @@ print("Device:", DEVICE)
 
 
 # =========================================================
+# SPEED SETTINGS (GPU ONLY)
+# =========================================================
+torch.backends.cudnn.benchmark = True
+
+USE_AMP = DEVICE.type == "cuda"
+scaler = torch.cuda.amp.GradScaler() if USE_AMP else None
+
+
+# =========================================================
 # REPRODUCIBILITY
 # =========================================================
 def set_seed(seed=42):
@@ -65,27 +74,23 @@ ABLATIONS = {
 
 
 # =========================================================
-# LOSS (FIXED — now includes duration)
+# LOSS (UNCHANGED SCIENTIFIC BEHAVIOR)
 # =========================================================
 def loss_fn(logits, dur_pred, moe_loss, batch):
 
     B, T, V = logits.shape
 
-    # -------------------------
-    # FIXATION LOSS
-    # -------------------------
+    # FIXATION LOSS (masked)
     fix = F.cross_entropy(
         logits.view(B * T, V),
         batch["scanpath"].view(B * T),
         reduction="none"
     ).view(B, T)
 
-    mask = batch["mask"]
+    mask = batch["mask"].to(logits.device)
     fix = (fix * mask).sum() / mask.sum()
 
-    # -------------------------
-    # DURATION LOSS (log space)
-    # -------------------------
+    # DURATION LOSS (log-space)
     target_dur = torch.log1p(batch["durations"])
 
     dur_loss = F.mse_loss(
@@ -96,47 +101,55 @@ def loss_fn(logits, dur_pred, moe_loss, batch):
 
     dur_loss = (dur_loss * mask).sum() / mask.sum()
 
-    # -------------------------
     # MOE LOSS
-    # -------------------------
     moe = moe_loss if torch.is_tensor(moe_loss) else torch.tensor(0.0, device=logits.device)
 
-    # -------------------------
-    # TOTAL (IMPORTANT BALANCING)
-    # -------------------------
     return fix + 0.1 * dur_loss + 0.01 * moe
 
 
 # =========================================================
-# FORWARD (FIXED)
+# FORWARD (DEVICE SAFE)
 # =========================================================
 def forward(model, batch):
 
     return model(
-        batch["input_ids"],
-        batch["attention_mask"],
-        batch["word_ids"],
-        batch["scanpath"],
-        batch["durations"],   # ← CRITICAL FIX
-        batch["family"],
-        batch["lang_id"]
+        batch["input_ids"].to(DEVICE),
+        batch["attention_mask"].to(DEVICE),
+        batch["word_ids"].to(DEVICE),
+        batch["scanpath"].to(DEVICE),
+        batch["durations"].to(DEVICE),
+        batch["family"].to(DEVICE),
+        batch["lang_id"].to(DEVICE)
     )
 
 
 # =========================================================
-# TRAIN STEP
+# TRAIN STEP (AMP ENABLED)
 # =========================================================
 def train_step(model, batch, optim):
 
-    logits, dur_pred, moe = forward(model, batch)
-
-    loss = loss_fn(logits, dur_pred, moe, batch)
-
     optim.zero_grad()
-    loss.backward()
-    optim.step()
 
-    return loss.item()
+    if USE_AMP:
+        with torch.cuda.amp.autocast():
+
+            logits, dur_pred, moe = forward(model, batch)
+            loss = loss_fn(logits, dur_pred, moe, batch)
+
+        scaler.scale(loss).backward()
+        scaler.step(optim)
+        scaler.update()
+
+        return loss.item()
+
+    else:
+        logits, dur_pred, moe = forward(model, batch)
+        loss = loss_fn(logits, dur_pred, moe, batch)
+
+        loss.backward()
+        optim.step()
+
+        return loss.item()
 
 
 # =========================================================
@@ -149,11 +162,6 @@ def evaluate(model, loader):
 
     with torch.no_grad():
         for batch in loader:
-
-            batch = {
-                k: v.to(DEVICE) if torch.is_tensor(v) else v
-                for k, v in batch.items()
-            }
 
             logits, dur_pred, moe = forward(model, batch)
             loss = loss_fn(logits, dur_pred, moe, batch)
@@ -181,11 +189,6 @@ def train(model, train_loader, val_loader, name, epochs=3):
 
         for i, batch in enumerate(train_loader):
 
-            batch = {
-                k: v.to(DEVICE) if torch.is_tensor(v) else v
-                for k, v in batch.items()
-            }
-
             loss = train_step(model, batch, optim)
             total += loss
 
@@ -205,7 +208,7 @@ def train(model, train_loader, val_loader, name, epochs=3):
 
 
 # =========================================================
-# RUN
+# ABLATION RUNNER
 # =========================================================
 def run_ablation(name, cfg, train_loader, val_loader):
 
@@ -236,16 +239,18 @@ if __name__ == "__main__":
 
     train_loader = DataLoader(
         MECO(train_data),
-        batch_size=2,
+        batch_size=4,
         shuffle=True,
-        collate_fn=collate
+        collate_fn=collate,
+        pin_memory=True
     )
 
     val_loader = DataLoader(
         MECO(val_data),
-        batch_size=2,
+        batch_size=4,
         shuffle=False,
-        collate_fn=collate
+        collate_fn=collate,
+        pin_memory=True
     )
 
     print("Starting ablations...\n")

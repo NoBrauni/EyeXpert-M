@@ -24,7 +24,6 @@ class MECO(Dataset):
 
         item = self.data[i]
 
-        # ONE tokenizer call (important)
         enc = tokenizer(
             item["sentence"],
             truncation=True,
@@ -32,31 +31,36 @@ class MECO(Dataset):
             return_tensors="pt"
         )
 
+        # -------------------------
+        # CLEAN WORD IDS HERE (IMPORTANT FIX)
+        # -------------------------
+        word_ids = enc.word_ids(batch_index=0)
+        word_ids = [-1 if x is None else x for x in word_ids]
+
         return {
-            # NLP
             "input_ids": enc["input_ids"].squeeze(0),
             "attention_mask": enc["attention_mask"].squeeze(0),
-            "word_ids": enc.word_ids(batch_index=0),  # critical
 
-            # eye-tracking
+            # now already clean tensor (no None anymore)
+            "word_ids": torch.tensor(word_ids, dtype=torch.long),
+
             "scanpath": torch.tensor(item["scanpath"], dtype=torch.long),
             "durations": torch.tensor(item["durations"], dtype=torch.float),
 
-            # meta
             "family": torch.tensor(LANG_FAMILY[item["lang"]], dtype=torch.long),
             "lang_id": torch.tensor(0)
         }
 
 
 # =========================================================
-# COLLATE
+# COLLATE (GPU-READY, CLEAN, MINIMAL OVERHEAD)
 # =========================================================
 def collate(batch):
 
     out = {}
 
     # -------------------------
-    # TOKEN SEQUENCES
+    # TOKEN INPUTS
     # -------------------------
     input_ids = [b["input_ids"] for b in batch]
     attn = [b["attention_mask"] for b in batch]
@@ -68,17 +72,10 @@ def collate(batch):
     out["attention_mask"] = attn
 
     # -------------------------
-    # WORD IDS (pad with None)
+    # WORD IDS (ALREADY CLEAN)
     # -------------------------
-    max_len = input_ids.size(1)
-
-    word_ids = []
-    for b in batch:
-        w = b["word_ids"]
-        w = w + [None] * (max_len - len(w))
-        word_ids.append(w)
-
-    out["word_ids"] = word_ids
+    word_ids = [b["word_ids"] for b in batch]
+    out["word_ids"] = rnn.pad_sequence(word_ids, batch_first=True, padding_value=-1)
 
     # -------------------------
     # SCANPATH + DURATIONS
@@ -90,7 +87,7 @@ def collate(batch):
     out["durations"] = rnn.pad_sequence(dur, batch_first=True, padding_value=0)
 
     # -------------------------
-    # MASK (for loss)
+    # MASK (IMPORTANT FOR LOSS)
     # -------------------------
     lengths = [len(b["scanpath"]) for b in batch]
     max_len = max(lengths)
@@ -98,7 +95,7 @@ def collate(batch):
     mask = torch.zeros(len(batch), max_len, dtype=torch.float)
 
     for i, l in enumerate(lengths):
-        mask[i, :l] = 1
+        mask[i, :l] = 1.0
 
     out["mask"] = mask
 

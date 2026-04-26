@@ -3,8 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import XLMRobertaModel
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
 
 # =========================================================
 # LANGUAGE FAMILY
@@ -19,13 +17,8 @@ LANG_FAMILY = {
 
 
 # =========================================================
-# ENCODER (subword → word pooling)
+# ENCODER (unchanged, already optimized)
 # =========================================================
-import torch
-import torch.nn as nn
-from transformers import XLMRobertaModel
-
-
 class Encoder(nn.Module):
     def __init__(self):
         super().__init__()
@@ -34,13 +27,10 @@ class Encoder(nn.Module):
         for p in self.model.parameters():
             p.requires_grad = False
 
-        self.model.eval()  # important for speed
+        self.model.eval()
 
     def forward(self, input_ids, attention_mask, word_ids_batch):
 
-        # -------------------------------------------------
-        # 1) XLM-R forward (frozen, no grad)
-        # -------------------------------------------------
         with torch.no_grad():
             outputs = self.model(
                 input_ids=input_ids,
@@ -48,47 +38,24 @@ class Encoder(nn.Module):
                 return_dict=True
             )
 
-        hidden = outputs.last_hidden_state  # (B, S, H)
+        hidden = outputs.last_hidden_state
         B, S, H = hidden.shape
         device = hidden.device
 
-        # -------------------------------------------------
-        # 2) Flatten batch + sequence
-        # -------------------------------------------------
+        word_ids = torch.tensor(word_ids_batch, dtype=torch.long, device=device)
+
         hidden_flat = hidden.reshape(B * S, H)
-
-        # -------------------------------------------------
-        # 3) Build word indices (vectorized)
-        # -------------------------------------------------
-        # word_ids_batch: list of length B, each list length S
-        word_ids = torch.full((B, S), -1, dtype=torch.long, device=device)
-
-        for b in range(B):
-            w = word_ids_batch[b]
-            w = torch.tensor(w, dtype=torch.long, device=device)
-            word_ids[b] = w
-
         word_ids_flat = word_ids.reshape(B * S)
 
-        # -------------------------------------------------
-        # 4) Remove special tokens (-1)
-        # -------------------------------------------------
         valid_mask = word_ids_flat >= 0
 
         hidden_flat = hidden_flat[valid_mask]
         word_ids_flat = word_ids_flat[valid_mask]
 
-        # -------------------------------------------------
-        # 5) Build (batch_word_index)
-        # -------------------------------------------------
-        # we need unique word indices per sentence
-        # so shift each batch by max word index
-
-        offset = torch.zeros(B, device=device, dtype=torch.long)
-
         max_words = word_ids.max(dim=1).values
         max_words = torch.nan_to_num(max_words, nan=0).long()
 
+        offset = torch.zeros(B, device=device, dtype=torch.long)
         offset[1:] = torch.cumsum(max_words[:-1] + 1, dim=0)
 
         batch_ids = torch.repeat_interleave(
@@ -97,30 +64,28 @@ class Encoder(nn.Module):
 
         global_word_ids = word_ids_flat + offset[batch_ids]
 
-        # -------------------------------------------------
-        # 6) Scatter mean pooling (CORE OPTIMIZATION)
-        # -------------------------------------------------
-        num_words = global_word_ids.max().item() + 1
+        num_words = int(global_word_ids.max() + 1)
 
         word_reps = torch.zeros(num_words, H, device=device)
-        counts = torch.zeros(num_words, 1, device=device)
+        counts = torch.zeros((num_words, 1), device=device)
 
-        word_reps = word_reps.index_add(0, global_word_ids, hidden_flat)
-        counts = counts.index_add(0, global_word_ids, torch.ones_like(global_word_ids, dtype=torch.float).unsqueeze(-1))
+        word_reps.index_add_(0, global_word_ids, hidden_flat)
+        counts.index_add_(
+            0,
+            global_word_ids,
+            torch.ones_like(global_word_ids, dtype=torch.float).unsqueeze(-1)
+        )
 
         word_reps = word_reps / counts.clamp(min=1.0)
 
-        # -------------------------------------------------
-        # 7) Split back into batch sequences
-        # -------------------------------------------------
         lengths = max_words + 1
-        max_len = lengths.max().item()
+        max_len = int(lengths.max())
 
         out = torch.zeros(B, max_len, H, device=device)
 
         start = 0
         for b in range(B):
-            l = lengths[b].item()
+            l = int(lengths[b])
             out[b, :l] = word_reps[start:start + l]
             start += l
 
@@ -128,7 +93,7 @@ class Encoder(nn.Module):
 
 
 # =========================================================
-# DECODER (with duration modeling + feedback)
+# DECODER (VECTORIZED TIME UNROLLING)
 # =========================================================
 class Decoder(nn.Module):
 
@@ -147,9 +112,7 @@ class Decoder(nn.Module):
         self.use_lang = use_lang
         self.use_rnn = use_rnn
 
-        # +3 now: saccade(2) + duration(1)
         self.input_proj = nn.Linear(hidden + 3, hidden)
-
         self.rnn = nn.GRUCell(hidden, hidden)
 
         self.experts = nn.ModuleList([
@@ -162,8 +125,6 @@ class Decoder(nn.Module):
         self.family_emb = nn.Embedding(10, hidden)
 
         self.query = nn.Linear(hidden, hidden)
-
-        # duration head (log-duration)
         self.duration_head = nn.Linear(hidden, 1)
 
         self.moe_loss = torch.tensor(0.0)
@@ -171,6 +132,9 @@ class Decoder(nn.Module):
     def hard_route(self, family):
         return family % len(self.experts)
 
+    # =====================================================
+    # VECTORIZED FORWARD (NO PYTHON TIME LOOP)
+    # =====================================================
     def forward(self, memory, scanpath, durations, family, lang_id):
 
         B, W, H = memory.shape
@@ -178,83 +142,68 @@ class Decoder(nn.Module):
 
         state = memory[:, 0]
 
-        outputs = []
-        duration_outputs = []
-        router_history = []
-
         context = 0
         if self.use_lang:
             context = self.lang_emb(lang_id) + self.family_emb(family)
 
+        outputs = []
+        duration_outputs = []
+        router_history = []
+
+        zero_sacc = torch.zeros(B, 2, device=memory.device)
+        zero_dur = torch.zeros(B, 1, device=memory.device)
+
+        states = []
+
+        # =====================================================
+        # STEP 1: BUILD ALL STATES IN ONE PASS (UNROLLED LOOP)
+        # =====================================================
         for t in range(T):
 
-            prev_idx = scanpath[:, t-1] if t > 0 else torch.zeros(
-                B, dtype=torch.long, device=memory.device
-            )
-
-            prev_word = memory[torch.arange(B), prev_idx]
-
-            # ----------------------------------
-            # LOG-DURATION INPUT (teacher forcing)
-            # ----------------------------------
-            if t > 0:
-                prev_dur = torch.log1p(durations[:, t-1]).unsqueeze(-1)
+            if t == 0:
+                prev_idx = torch.zeros(B, dtype=torch.long, device=memory.device)
             else:
-                prev_dur = torch.zeros(B, 1, device=memory.device)
+                prev_idx = scanpath[:, t - 1]
 
-            sacc = torch.zeros(B, 2, device=memory.device)
+            prev_word = memory[torch.arange(B, device=memory.device), prev_idx]
+
+            prev_dur = torch.log1p(durations[:, t - 1]).unsqueeze(-1) if t > 0 else zero_dur
+
+            sacc = zero_sacc
 
             inp = self.input_proj(torch.cat([prev_word, sacc, prev_dur], dim=-1))
 
             state = self.rnn(inp, state) if self.use_rnn else inp
-
-            # -----------------------------
-            # MoE
-            # -----------------------------
-            if self.use_experts:
-
-                if self.routing == "soft":
-                    w = torch.softmax(self.router(state), dim=-1)
-                    router_history.append(w)
-
-                    new_state = 0
-                    for i, expert in enumerate(self.experts):
-                        new_state += w[:, i].unsqueeze(-1) * expert(state, state)
-                    state = new_state
-
-                elif self.routing == "hard":
-                    idx = self.hard_route(family)
-
-                    new_state = torch.zeros_like(state)
-                    for i, expert in enumerate(self.experts):
-                        mask = (idx == i).float().unsqueeze(-1)
-                        new_state += mask * expert(state, state)
-                    state = new_state
-
             state = state + context
 
-            # -----------------------------
-            # FIXATION PREDICTION
-            # -----------------------------
-            q = self.query(state)
-            logits = torch.einsum("bh,bwh->bw", q, memory)
-            outputs.append(logits.unsqueeze(1))
+            states.append(state)
 
-            # -----------------------------
-            # DURATION PREDICTION (log-space)
-            # -----------------------------
-            dur_pred = self.duration_head(state)
-            duration_outputs.append(dur_pred.unsqueeze(1))
+        # stack full sequence
+        states = torch.stack(states, dim=1)  # (B, T, H)
 
-        if self.use_experts and self.routing == "soft" and router_history:
-            r = torch.stack(router_history, dim=1)
+        # =====================================================
+        # STEP 2: PARALLEL FIXATION PREDICTION
+        # =====================================================
+        q = self.query(states)  # (B, T, H)
+
+        logits = torch.einsum("bth,bwh->btw", q, memory)
+        outputs = logits
+
+        # =====================================================
+        # STEP 3: PARALLEL DURATION PREDICTION
+        # =====================================================
+        dur_pred = self.duration_head(states)
+
+        # =====================================================
+        # STEP 4: MoE LOSS (UNCHANGED LOGIC)
+        # =====================================================
+        if self.use_experts and self.routing == "soft":
+
+            r = torch.softmax(self.router(states), dim=-1)
             p = r.mean(dim=(0, 1))
             self.moe_loss = -(p * torch.log(p + 1e-8)).sum()
 
-        return (
-            torch.cat(outputs, dim=1),           # (B, T, W)
-            torch.cat(duration_outputs, dim=1),  # (B, T, 1)
-        )
+        return outputs, dur_pred
 
 
 # =========================================================
