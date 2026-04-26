@@ -21,6 +21,11 @@ LANG_FAMILY = {
 # =========================================================
 # ENCODER (subword → word pooling)
 # =========================================================
+import torch
+import torch.nn as nn
+from transformers import XLMRobertaModel
+
+
 class Encoder(nn.Module):
     def __init__(self):
         super().__init__()
@@ -29,48 +34,95 @@ class Encoder(nn.Module):
         for p in self.model.parameters():
             p.requires_grad = False
 
+        self.model.eval()  # important for speed
+
     def forward(self, input_ids, attention_mask, word_ids_batch):
 
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            return_dict=True
-        )
+        # -------------------------------------------------
+        # 1) XLM-R forward (frozen, no grad)
+        # -------------------------------------------------
+        with torch.no_grad():
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                return_dict=True
+            )
 
-        subword_hidden = outputs.last_hidden_state  # (B, S, H)
+        hidden = outputs.last_hidden_state  # (B, S, H)
+        B, S, H = hidden.shape
+        device = hidden.device
 
-        batch_word_reps = []
+        # -------------------------------------------------
+        # 2) Flatten batch + sequence
+        # -------------------------------------------------
+        hidden_flat = hidden.reshape(B * S, H)
 
-        for b in range(subword_hidden.size(0)):
+        # -------------------------------------------------
+        # 3) Build word indices (vectorized)
+        # -------------------------------------------------
+        # word_ids_batch: list of length B, each list length S
+        word_ids = torch.full((B, S), -1, dtype=torch.long, device=device)
 
-            word_ids = word_ids_batch[b]
-            hidden = subword_hidden[b]
+        for b in range(B):
+            w = word_ids_batch[b]
+            w = torch.tensor(w, dtype=torch.long, device=device)
+            word_ids[b] = w
 
-            word_map = {}
+        word_ids_flat = word_ids.reshape(B * S)
 
-            for i, w_id in enumerate(word_ids):
-                if w_id is None:
-                    continue
-                word_map.setdefault(w_id, []).append(hidden[i])
+        # -------------------------------------------------
+        # 4) Remove special tokens (-1)
+        # -------------------------------------------------
+        valid_mask = word_ids_flat >= 0
 
-            pooled = []
-            for w_id in sorted(word_map.keys()):
-                pooled.append(torch.stack(word_map[w_id]).mean(0))
+        hidden_flat = hidden_flat[valid_mask]
+        word_ids_flat = word_ids_flat[valid_mask]
 
-            batch_word_reps.append(torch.stack(pooled))
+        # -------------------------------------------------
+        # 5) Build (batch_word_index)
+        # -------------------------------------------------
+        # we need unique word indices per sentence
+        # so shift each batch by max word index
 
-        max_len = max(x.size(0) for x in batch_word_reps)
-        H = subword_hidden.size(-1)
+        offset = torch.zeros(B, device=device, dtype=torch.long)
 
-        out = torch.zeros(
-            subword_hidden.size(0),
-            max_len,
-            H,
-            device=subword_hidden.device
-        )
+        max_words = word_ids.max(dim=1).values
+        max_words = torch.nan_to_num(max_words, nan=0).long()
 
-        for i, x in enumerate(batch_word_reps):
-            out[i, :x.size(0)] = x
+        offset[1:] = torch.cumsum(max_words[:-1] + 1, dim=0)
+
+        batch_ids = torch.repeat_interleave(
+            torch.arange(B, device=device), S
+        )[valid_mask]
+
+        global_word_ids = word_ids_flat + offset[batch_ids]
+
+        # -------------------------------------------------
+        # 6) Scatter mean pooling (CORE OPTIMIZATION)
+        # -------------------------------------------------
+        num_words = global_word_ids.max().item() + 1
+
+        word_reps = torch.zeros(num_words, H, device=device)
+        counts = torch.zeros(num_words, 1, device=device)
+
+        word_reps = word_reps.index_add(0, global_word_ids, hidden_flat)
+        counts = counts.index_add(0, global_word_ids, torch.ones_like(global_word_ids, dtype=torch.float).unsqueeze(-1))
+
+        word_reps = word_reps / counts.clamp(min=1.0)
+
+        # -------------------------------------------------
+        # 7) Split back into batch sequences
+        # -------------------------------------------------
+        lengths = max_words + 1
+        max_len = lengths.max().item()
+
+        out = torch.zeros(B, max_len, H, device=device)
+
+        start = 0
+        for b in range(B):
+            l = lengths[b].item()
+            out[b, :l] = word_reps[start:start + l]
+            start += l
 
         return out
 
