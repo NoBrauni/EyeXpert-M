@@ -1,15 +1,13 @@
-import json
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+import torch.nn.utils.rnn as rnn
+from torch.utils.data import Dataset
+from transformers import XLMRobertaTokenizerFast
 
-from model import EyeXpertXLMR, LANG_FAMILY
+from model import LANG_FAMILY
 
-# =========================================================
-# DEVICE (ONLY CHANGE THIS FOR GPU)
-# =========================================================
-DEVICE = "cpu"
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+tokenizer = XLMRobertaTokenizerFast.from_pretrained("xlm-roberta-base")
 
 
 # =========================================================
@@ -23,13 +21,30 @@ class MECO(Dataset):
         return len(self.data)
 
     def __getitem__(self, i):
+
         item = self.data[i]
 
+        # ONE tokenizer call (important)
+        enc = tokenizer(
+            item["sentence"],
+            truncation=True,
+            padding=False,
+            return_tensors="pt"
+        )
+
         return {
-            "sentence": item["sentence"],
+            # NLP
+            "input_ids": enc["input_ids"].squeeze(0),
+            "attention_mask": enc["attention_mask"].squeeze(0),
+            "word_ids": enc.word_ids(batch_index=0),  # critical
+
+            # eye-tracking
             "scanpath": torch.tensor(item["scanpath"], dtype=torch.long),
             "durations": torch.tensor(item["durations"], dtype=torch.float),
-            "family": torch.tensor(LANG_FAMILY.get(item["lang"], 0), dtype=torch.long),
+
+            # meta
+            "family": torch.tensor(LANG_FAMILY[item["lang"]], dtype=torch.long),
+            "lang_id": torch.tensor(0)
         }
 
 
@@ -38,160 +53,59 @@ class MECO(Dataset):
 # =========================================================
 def collate(batch):
 
-    sentences = [b["sentence"] for b in batch]
+    out = {}
 
-    scanpaths, durations, families, masks = [], [], [], []
+    # -------------------------
+    # TOKEN SEQUENCES
+    # -------------------------
+    input_ids = [b["input_ids"] for b in batch]
+    attn = [b["attention_mask"] for b in batch]
 
-    max_len = max(len(b["scanpath"]) for b in batch)
+    input_ids = rnn.pad_sequence(input_ids, batch_first=True, padding_value=0)
+    attn = rnn.pad_sequence(attn, batch_first=True, padding_value=0)
 
+    out["input_ids"] = input_ids
+    out["attention_mask"] = attn
+
+    # -------------------------
+    # WORD IDS (pad with None)
+    # -------------------------
+    max_len = input_ids.size(1)
+
+    word_ids = []
     for b in batch:
+        w = b["word_ids"]
+        w = w + [None] * (max_len - len(w))
+        word_ids.append(w)
 
-        sp = b["scanpath"]
-        dur = b["durations"]
-        L = len(sp)
+    out["word_ids"] = word_ids
 
-        if L < max_len:
-            pad = max_len - L
-            sp = torch.cat([sp, torch.zeros(pad, dtype=torch.long)])
-            dur = torch.cat([dur, torch.zeros(pad)])
+    # -------------------------
+    # SCANPATH + DURATIONS
+    # -------------------------
+    scan = [b["scanpath"] for b in batch]
+    dur = [b["durations"] for b in batch]
 
-        mask = torch.zeros(max_len)
-        mask[:L] = 1
+    out["scanpath"] = rnn.pad_sequence(scan, batch_first=True, padding_value=0)
+    out["durations"] = rnn.pad_sequence(dur, batch_first=True, padding_value=0)
 
-        scanpaths.append(sp)
-        durations.append(dur)
-        families.append(b["family"])
-        masks.append(mask)
+    # -------------------------
+    # MASK (for loss)
+    # -------------------------
+    lengths = [len(b["scanpath"]) for b in batch]
+    max_len = max(lengths)
 
-    return {
-        "sentences": sentences,
-        "scanpath": torch.stack(scanpaths),
-        "durations": torch.stack(durations),
-        "family": torch.stack(families),
-        "mask": torch.stack(masks)
-    }
+    mask = torch.zeros(len(batch), max_len, dtype=torch.float)
 
+    for i, l in enumerate(lengths):
+        mask[i, :l] = 1
 
-# =========================================================
-# LOSS
-# =========================================================
-def loss_fn(logits, dur_pred, moe_loss, batch):
+    out["mask"] = mask
 
-    B, T, V = logits.shape
+    # -------------------------
+    # META
+    # -------------------------
+    out["family"] = torch.tensor([b["family"] for b in batch], dtype=torch.long)
+    out["lang_id"] = torch.tensor([b["lang_id"] for b in batch], dtype=torch.long)
 
-    fix = F.cross_entropy(
-        logits.view(B * T, V),
-        batch["scanpath"].view(B * T),
-        reduction="none"
-    ).view(B, T)
-
-    mask = batch["mask"]
-
-    fix = (fix * mask).sum() / mask.sum()
-
-    dur = F.mse_loss(
-        torch.log1p(dur_pred),
-        torch.log1p(batch["durations"]),
-        reduction="none"
-    )
-
-    dur = (dur * mask).sum() / mask.sum()
-
-    moe = moe_loss
-
-    return fix + 0.2 * dur + 0.01 * moe
-
-
-# =========================================================
-# TRAIN STEP
-# =========================================================
-def train_step(model, batch, optim):
-
-    # move tensors to device
-    batch = {
-        k: v.to(DEVICE) if torch.is_tensor(v) else v
-        for k, v in batch.items()
-    }
-
-    B = len(batch["family"])
-
-    # IMPORTANT FIX:
-    # pass real family as lang_id unless you explicitly ablate it later
-    lang_id = batch["family"].clone()
-
-    logits, dur, moe_loss = model(
-        batch["sentences"],
-        batch["scanpath"],
-        batch["durations"],
-        batch["family"],
-        lang_id
-    )
-
-    loss = loss_fn(logits, dur, moe_loss, batch)
-
-    optim.zero_grad()
-    loss.backward()
-    optim.step()
-
-    return loss.item()
-
-
-# =========================================================
-# TRAIN LOOP
-# =========================================================
-def train(model, loader, epochs=2):
-
-    model.to(DEVICE)
-    optim = torch.optim.Adam(model.parameters(), lr=2e-4)
-
-    for ep in range(epochs):
-
-        total = 0
-
-        for i, batch in enumerate(loader):
-
-            loss = train_step(model, batch, optim)
-            total += loss
-
-            if i % 10 == 0:
-                print(f"[Epoch {ep}] Step {i} | Loss {loss:.4f}")
-
-        print(f"\nEpoch {ep} | Avg Loss {total / len(loader):.4f}\n")
-
-
-# =========================================================
-# MAIN
-# =========================================================
-if __name__ == "__main__":
-
-    print("Loading dataset...")
-
-    data = json.load(open("meco_train.json", "r", encoding="utf-8"))
-    data = data[:300]  # CPU debug subset
-
-    split = int(0.8 * len(data))
-
-    train_data = data[:split]
-    val_data = data[split:]
-
-    train_loader = DataLoader(
-        MECO(train_data),
-        batch_size=2,
-        shuffle=True,
-        collate_fn=collate
-    )
-
-    val_loader = DataLoader(
-        MECO(val_data),
-        batch_size=2,
-        shuffle=False,
-        collate_fn=collate
-    )
-
-    print("Building model...")
-
-    model = EyeXpertXLMR()
-
-    print("Starting training...")
-
-    train(model, train_loader, epochs=2)
+    return out

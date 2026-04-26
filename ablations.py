@@ -1,16 +1,18 @@
 import json
 import random
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from model import EyeXpertXLMR, LANG_FAMILY
+from model import EyeXpertM
 from train_meco import MECO, collate
 
 
 # =========================================================
 # DEVICE
 # =========================================================
-DEVICE = "cpu"
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Device:", DEVICE)
 
 
 # =========================================================
@@ -19,16 +21,16 @@ DEVICE = "cpu"
 def set_seed(seed=42):
     random.seed(seed)
     torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 # =========================================================
-# SAFE SPLIT (NO LEAKAGE)
+# DATA SPLIT
 # =========================================================
 def split_data(data, seed=42):
 
     set_seed(seed)
-
-    # shuffle once deterministically
     data = data.copy()
     random.shuffle(data)
 
@@ -50,60 +52,74 @@ def split_data(data, seed=42):
 
 
 # =========================================================
-# ABLATIONS (A0–A4)
+# ABLATIONS
 # =========================================================
 ABLATIONS = {
-    "A0_full":       dict(use_moe=True,  use_saccade=True,  use_lang=True),
-    "A1_no_moe":     dict(use_moe=False, use_saccade=True,  use_lang=True),
-    "A2_no_saccade": dict(use_moe=True,  use_saccade=False, use_lang=True),
-    "A3_no_lang":    dict(use_moe=True,  use_saccade=True,  use_lang=False),
-    "A4_simple":     dict(use_moe=False, use_saccade=False, use_lang=False),
+
+    "A0_baseline": dict(use_experts=False, routing="none", use_lang=False),
+    "A1_lang_cond": dict(use_experts=False, routing="none", use_lang=True),
+    "A2_hard_moe": dict(use_experts=True, routing="hard", use_lang=False),
+    "A3_hard_moe_lang": dict(use_experts=True, routing="hard", use_lang=True),
+    "A4_soft_moe": dict(use_experts=True, routing="soft", use_lang=False),
 }
 
 
 # =========================================================
-# LOSS (same as training)
+# LOSS (FIXED — now includes duration)
 # =========================================================
 def loss_fn(logits, dur_pred, moe_loss, batch):
 
     B, T, V = logits.shape
 
-    fix = torch.nn.functional.cross_entropy(
+    # -------------------------
+    # FIXATION LOSS
+    # -------------------------
+    fix = F.cross_entropy(
         logits.view(B * T, V),
         batch["scanpath"].view(B * T),
         reduction="none"
     ).view(B, T)
 
     mask = batch["mask"]
-
     fix = (fix * mask).sum() / mask.sum()
 
-    dur = torch.nn.functional.mse_loss(
-        torch.log1p(dur_pred),
-        torch.log1p(batch["durations"]),
+    # -------------------------
+    # DURATION LOSS (log space)
+    # -------------------------
+    target_dur = torch.log1p(batch["durations"])
+
+    dur_loss = F.mse_loss(
+        dur_pred.squeeze(-1),
+        target_dur,
         reduction="none"
     )
 
-    dur = (dur * mask).sum() / mask.sum()
+    dur_loss = (dur_loss * mask).sum() / mask.sum()
 
-    moe = moe_loss if torch.is_tensor(moe_loss) else torch.tensor(0.0)
+    # -------------------------
+    # MOE LOSS
+    # -------------------------
+    moe = moe_loss if torch.is_tensor(moe_loss) else torch.tensor(0.0, device=logits.device)
 
-    return fix + 0.2 * dur + 0.01 * moe
+    # -------------------------
+    # TOTAL (IMPORTANT BALANCING)
+    # -------------------------
+    return fix + 0.1 * dur_loss + 0.01 * moe
 
 
 # =========================================================
-# FORWARD PASS
+# FORWARD (FIXED)
 # =========================================================
 def forward(model, batch):
 
-    lang_id = torch.zeros(len(batch["family"]), dtype=torch.long, device=DEVICE)
-
     return model(
-        batch["sentences"],
+        batch["input_ids"],
+        batch["attention_mask"],
+        batch["word_ids"],
         batch["scanpath"],
-        batch["durations"],
+        batch["durations"],   # ← CRITICAL FIX
         batch["family"],
-        lang_id
+        batch["lang_id"]
     )
 
 
@@ -112,9 +128,9 @@ def forward(model, batch):
 # =========================================================
 def train_step(model, batch, optim):
 
-    logits, dur, moe = forward(model, batch)
+    logits, dur_pred, moe = forward(model, batch)
 
-    loss = loss_fn(logits, dur, moe, batch)
+    loss = loss_fn(logits, dur_pred, moe, batch)
 
     optim.zero_grad()
     loss.backward()
@@ -124,7 +140,7 @@ def train_step(model, batch, optim):
 
 
 # =========================================================
-# EVALUATION
+# EVAL
 # =========================================================
 def evaluate(model, loader):
 
@@ -134,10 +150,13 @@ def evaluate(model, loader):
     with torch.no_grad():
         for batch in loader:
 
-            batch = {k: v.to(DEVICE) if torch.is_tensor(v) else v for k, v in batch.items()}
+            batch = {
+                k: v.to(DEVICE) if torch.is_tensor(v) else v
+                for k, v in batch.items()
+            }
 
-            logits, dur, moe = forward(model, batch)
-            loss = loss_fn(logits, dur, moe, batch)
+            logits, dur_pred, moe = forward(model, batch)
+            loss = loss_fn(logits, dur_pred, moe, batch)
 
             total += loss.item()
 
@@ -148,7 +167,7 @@ def evaluate(model, loader):
 # =========================================================
 # TRAIN LOOP
 # =========================================================
-def train(model, train_loader, val_loader, name, epochs=2):
+def train(model, train_loader, val_loader, name, epochs=3):
 
     model.to(DEVICE)
 
@@ -162,12 +181,15 @@ def train(model, train_loader, val_loader, name, epochs=2):
 
         for i, batch in enumerate(train_loader):
 
-            batch = {k: v.to(DEVICE) if torch.is_tensor(v) else v for k, v in batch.items()}
+            batch = {
+                k: v.to(DEVICE) if torch.is_tensor(v) else v
+                for k, v in batch.items()
+            }
 
             loss = train_step(model, batch, optim)
             total += loss
 
-            if i % 10 == 0:
+            if i % 20 == 0:
                 print(f"[{name}] Epoch {ep} Step {i} | Loss {loss:.4f}")
 
         val_loss = evaluate(model, val_loader)
@@ -183,7 +205,7 @@ def train(model, train_loader, val_loader, name, epochs=2):
 
 
 # =========================================================
-# RUN ABLATION
+# RUN
 # =========================================================
 def run_ablation(name, cfg, train_loader, val_loader):
 
@@ -191,9 +213,9 @@ def run_ablation(name, cfg, train_loader, val_loader):
     print("ABLATION:", name)
     print("========================\n")
 
-    model = EyeXpertXLMR(
-        use_moe=cfg["use_moe"],
-        use_saccade=cfg["use_saccade"],
+    model = EyeXpertM(
+        use_experts=cfg["use_experts"],
+        routing=cfg["routing"],
         use_lang=cfg["use_lang"]
     )
 
@@ -208,7 +230,7 @@ if __name__ == "__main__":
     print("Loading dataset...")
 
     data = json.load(open("meco_train.json", "r", encoding="utf-8"))
-    data = data[:500]  # CPU subset
+    data = data[:500]
 
     train_data, val_data, test_data = split_data(data)
 
@@ -226,7 +248,7 @@ if __name__ == "__main__":
         collate_fn=collate
     )
 
-    print("Device:", DEVICE)
+    print("Starting ablations...\n")
 
     for name, cfg in ABLATIONS.items():
         run_ablation(name, cfg, train_loader, val_loader)

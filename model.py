@@ -1,155 +1,124 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import XLMRobertaModel, XLMRobertaTokenizerFast
+from transformers import XLMRobertaModel
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
 # =========================================================
-# CONFIG
+# LANGUAGE FAMILY
 # =========================================================
-DEVICE = "cpu"
-
-tokenizer = XLMRobertaTokenizerFast.from_pretrained("xlm-roberta-base")
-
 LANG_FAMILY = {
     "en": 0, "en_uk": 0, "du": 0, "ge": 0, "ge_po": 0, "ge_zu": 0,
     "sp": 1, "sp_ch": 1, "it": 1, "bp": 1,
-    "no": 2, "da": 2, "ic": 2, "se": 2,
-    "ru": 3, "ru_mo": 3,
+    "no": 2, "da": 2, "ic": 2,
+    "se": 3, "ru": 3, "ru_mo": 3,
     "fi": 4, "ee": 4,
 }
 
 
 # =========================================================
-# ENCODER (Frozen XLM-R)
+# ENCODER (subword → word pooling)
 # =========================================================
-class XLMREncoder(nn.Module):
+class Encoder(nn.Module):
     def __init__(self):
         super().__init__()
-        self.encoder = XLMRobertaModel.from_pretrained("xlm-roberta-base")
+        self.model = XLMRobertaModel.from_pretrained("xlm-roberta-base")
 
-        for p in self.encoder.parameters():
+        for p in self.model.parameters():
             p.requires_grad = False
 
-    def forward(self, sentences):
-        enc = tokenizer(
-            sentences,
-            padding=True,
-            truncation=True,
-            return_tensors="pt"
-        ).to(DEVICE)
+    def forward(self, input_ids, attention_mask, word_ids_batch):
 
-        out = self.encoder(
-            input_ids=enc["input_ids"],
-            attention_mask=enc["attention_mask"]
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            return_dict=True
         )
 
-        return out.last_hidden_state, enc
+        subword_hidden = outputs.last_hidden_state  # (B, S, H)
+
+        batch_word_reps = []
+
+        for b in range(subword_hidden.size(0)):
+
+            word_ids = word_ids_batch[b]
+            hidden = subword_hidden[b]
+
+            word_map = {}
+
+            for i, w_id in enumerate(word_ids):
+                if w_id is None:
+                    continue
+                word_map.setdefault(w_id, []).append(hidden[i])
+
+            pooled = []
+            for w_id in sorted(word_map.keys()):
+                pooled.append(torch.stack(word_map[w_id]).mean(0))
+
+            batch_word_reps.append(torch.stack(pooled))
+
+        max_len = max(x.size(0) for x in batch_word_reps)
+        H = subword_hidden.size(-1)
+
+        out = torch.zeros(
+            subword_hidden.size(0),
+            max_len,
+            H,
+            device=subword_hidden.device
+        )
+
+        for i, x in enumerate(batch_word_reps):
+            out[i, :x.size(0)] = x
+
+        return out
 
 
 # =========================================================
-# WORD POOLING (unchanged but stable)
-# =========================================================
-def pool_to_words(hidden_states, encodings, sentences):
-
-    batch_out = []
-
-    for i in range(len(sentences)):
-
-        word_ids = encodings.word_ids(batch_index=i)
-        hs = hidden_states[i]
-
-        groups = {}
-
-        for idx, w_id in enumerate(word_ids):
-            if w_id is None:
-                continue
-            groups.setdefault(w_id, []).append(hs[idx])
-
-        words = []
-
-        for k in sorted(groups.keys()):
-            words.append(torch.stack(groups[k]).mean(0))
-
-        batch_out.append(torch.stack(words))
-
-    return batch_out
-
-
-# =========================================================
-# DECODER (clean ablation-safe design)
+# DECODER (with duration modeling + feedback)
 # =========================================================
 class Decoder(nn.Module):
 
-    def __init__(
-        self,
-        hidden,
-        n_experts=3,
-        use_moe=True,
-        use_saccade=True,
-        use_lang=True,
-        use_rnn=True
-    ):
+    def __init__(self,
+                 hidden,
+                 n_experts=5,
+                 use_experts=True,
+                 routing="none",
+                 use_lang=True,
+                 use_rnn=True):
+
         super().__init__()
 
-        self.hidden = hidden
-
-        self.use_moe = use_moe
-        self.use_saccade = use_saccade
+        self.use_experts = use_experts
+        self.routing = routing
         self.use_lang = use_lang
         self.use_rnn = use_rnn
 
-        # -------------------------
-        # INPUT projection (fixed size!)
-        # -------------------------
-        self.input_proj = nn.Linear(hidden + 2, hidden)
+        # +3 now: saccade(2) + duration(1)
+        self.input_proj = nn.Linear(hidden + 3, hidden)
 
-        # -------------------------
-        # Recurrent state model (ablated cleanly)
-        # -------------------------
         self.rnn = nn.GRUCell(hidden, hidden)
 
-        # -------------------------
-        # MoE experts (state update only)
-        # -------------------------
         self.experts = nn.ModuleList([
-            nn.GRUCell(hidden, hidden)
-            for _ in range(n_experts)
+            nn.GRUCell(hidden, hidden) for _ in range(n_experts)
         ])
 
         self.router = nn.Linear(hidden, n_experts)
 
-        # -------------------------
-        # Pointer query
-        # -------------------------
+        self.lang_emb = nn.Embedding(10, hidden)
+        self.family_emb = nn.Embedding(10, hidden)
+
         self.query = nn.Linear(hidden, hidden)
 
-        # -------------------------
-        # Language / family embeddings
-        # -------------------------
-        self.family_emb = nn.Embedding(6, hidden)
-        self.lang_emb = nn.Embedding(len(LANG_FAMILY) + 1, hidden)
+        # duration head (log-duration)
+        self.duration_head = nn.Linear(hidden, 1)
 
-        # -------------------------
-        # MoE diagnostics
-        # -------------------------
-        self.moe_loss = None
+        self.moe_loss = torch.tensor(0.0)
 
-    # -----------------------------------------------------
-    # SAFE SACCADE FEATURE (FIXED)
-    # -----------------------------------------------------
-    def compute_saccade(self, scanpath, t):
+    def hard_route(self, family):
+        return family % len(self.experts)
 
-        if not self.use_saccade or t < 2:
-            return torch.zeros(scanpath.size(0), 2, device=scanpath.device)
-
-        delta = scanpath[:, t-1] - scanpath[:, t-2]
-
-        return torch.stack([
-            delta.float(),
-            delta.abs().float()
-        ], dim=-1)
-
-    # -----------------------------------------------------
     def forward(self, memory, scanpath, durations, family, lang_id):
 
         B, W, H = memory.shape
@@ -158,149 +127,125 @@ class Decoder(nn.Module):
         state = memory[:, 0]
 
         outputs = []
-        router_hist = []
+        duration_outputs = []
+        router_history = []
 
-        # language context (clean switch)
+        context = 0
         if self.use_lang:
-            context = self.family_emb(family) + self.lang_emb(lang_id)
-        else:
-            context = torch.zeros_like(state)
+            context = self.lang_emb(lang_id) + self.family_emb(family)
 
         for t in range(T):
 
-            # previous fixation
             prev_idx = scanpath[:, t-1] if t > 0 else torch.zeros(
                 B, dtype=torch.long, device=memory.device
             )
 
             prev_word = memory[torch.arange(B), prev_idx]
 
-            # saccade (clean ablation signal)
-            sacc = self.compute_saccade(scanpath, t)
-
-            # input construction (stable across ablations)
-            inp = torch.cat([prev_word, sacc], dim=-1)
-            inp = self.input_proj(inp)
-
-            # optional recurrence ablation
-            if self.use_rnn:
-                state = self.rnn(inp, state)
+            # ----------------------------------
+            # LOG-DURATION INPUT (teacher forcing)
+            # ----------------------------------
+            if t > 0:
+                prev_dur = torch.log1p(durations[:, t-1]).unsqueeze(-1)
             else:
-                state = inp
+                prev_dur = torch.zeros(B, 1, device=memory.device)
 
-            # MoE update (clean separation)
-            if self.use_moe:
+            sacc = torch.zeros(B, 2, device=memory.device)
 
-                weights = torch.softmax(self.router(state), dim=-1)
-                router_hist.append(weights)
+            inp = self.input_proj(torch.cat([prev_word, sacc, prev_dur], dim=-1))
 
-                new_state = 0
+            state = self.rnn(inp, state) if self.use_rnn else inp
 
-                for i, expert in enumerate(self.experts):
-                    new_state = new_state + weights[:, i].unsqueeze(-1) * expert(state, state)
+            # -----------------------------
+            # MoE
+            # -----------------------------
+            if self.use_experts:
 
-                state = new_state
+                if self.routing == "soft":
+                    w = torch.softmax(self.router(state), dim=-1)
+                    router_history.append(w)
+
+                    new_state = 0
+                    for i, expert in enumerate(self.experts):
+                        new_state += w[:, i].unsqueeze(-1) * expert(state, state)
+                    state = new_state
+
+                elif self.routing == "hard":
+                    idx = self.hard_route(family)
+
+                    new_state = torch.zeros_like(state)
+                    for i, expert in enumerate(self.experts):
+                        mask = (idx == i).float().unsqueeze(-1)
+                        new_state += mask * expert(state, state)
+                    state = new_state
 
             state = state + context
 
+            # -----------------------------
+            # FIXATION PREDICTION
+            # -----------------------------
             q = self.query(state)
-
             logits = torch.einsum("bh,bwh->bw", q, memory)
-
             outputs.append(logits.unsqueeze(1))
 
-        # -------------------------
-        # MoE entropy penalty (stable)
-        # -------------------------
-        if self.use_moe and len(router_hist) > 0:
+            # -----------------------------
+            # DURATION PREDICTION (log-space)
+            # -----------------------------
+            dur_pred = self.duration_head(state)
+            duration_outputs.append(dur_pred.unsqueeze(1))
 
-            r = torch.stack(router_hist, dim=1)  # [B,T,E]
-            p = r.reshape(-1, r.size(-1)).mean(dim=0)
-
+        if self.use_experts and self.routing == "soft" and router_history:
+            r = torch.stack(router_history, dim=1)
+            p = r.mean(dim=(0, 1))
             self.moe_loss = -(p * torch.log(p + 1e-8)).sum()
-        else:
-            self.moe_loss = torch.tensor(0.0, device=memory.device)
 
-        return torch.cat(outputs, dim=1), state
-
-
-# =========================================================
-# DURATION HEAD
-# =========================================================
-class DurationHead(nn.Module):
-
-    def __init__(self, hidden):
-        super().__init__()
-
-        self.mlp = nn.Sequential(
-            nn.Linear(hidden * 2, hidden),
-            nn.ReLU(),
-            nn.Linear(hidden, 1),
-            nn.Softplus()
+        return (
+            torch.cat(outputs, dim=1),           # (B, T, W)
+            torch.cat(duration_outputs, dim=1),  # (B, T, 1)
         )
 
-    def forward(self, state, word_emb):
-        return self.mlp(torch.cat([state, word_emb], dim=-1)).squeeze(-1)
-
 
 # =========================================================
-# FULL MODEL (A0–A4 CLEAN SUPPORT)
+# FULL MODEL
 # =========================================================
-class EyeXpertXLMR(nn.Module):
+class EyeXpertM(nn.Module):
 
-    def __init__(
-        self,
-        use_moe=True,
-        use_saccade=True,
-        use_lang=True,
-        use_rnn=True
-    ):
+    def __init__(self,
+                 use_experts=True,
+                 routing="none",
+                 use_lang=True,
+                 use_rnn=True):
+
         super().__init__()
 
-        self.encoder = XLMREncoder()
-
-        hidden = self.encoder.encoder.config.hidden_size
+        self.encoder = Encoder()
+        hidden = self.encoder.model.config.hidden_size
 
         self.decoder = Decoder(
             hidden,
-            use_moe=use_moe,
-            use_saccade=use_saccade,
+            use_experts=use_experts,
+            routing=routing,
             use_lang=use_lang,
             use_rnn=use_rnn
         )
 
-        self.duration_head = DurationHead(hidden)
+    def forward(self,
+                input_ids,
+                attention_mask,
+                word_ids,
+                scanpath,
+                durations,
+                family,
+                lang_id):
 
-    def forward(self, sentences, scanpath, durations, family, lang_id):
+        memory = self.encoder(input_ids, attention_mask, word_ids)
 
-        token_memory, enc = self.encoder(sentences)
-
-        memory_list = pool_to_words(token_memory, enc, sentences)
-
-        B = len(memory_list)
-        W = max(x.size(0) for x in memory_list)
-        H = memory_list[0].size(1)
-
-        memory = torch.zeros(B, W, H, device=token_memory.device)
-
-        for i, m in enumerate(memory_list):
-            memory[i, :m.size(0)] = m
-
-        logits, state = self.decoder(
+        logits, dur_pred = self.decoder(
             memory,
             scanpath,
             durations,
             family,
             lang_id
         )
-
-        B, T = scanpath.shape
-
-        word_embs = memory[torch.arange(B).unsqueeze(1), scanpath]
-
-        dur_pred = self.duration_head(
-            state.unsqueeze(1).expand(-1, T, -1).reshape(B * T, -1),
-            word_embs.reshape(B * T, -1)
-        ).view(B, T)
 
         return logits, dur_pred, self.decoder.moe_loss

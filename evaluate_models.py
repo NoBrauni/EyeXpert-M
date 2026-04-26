@@ -3,30 +3,41 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from model import EyeXpertXLMR
+from model import EyeXpertM
 from train_meco import MECO, collate
 
 
 # =========================================================
-# CONFIG
+# DEVICE
 # =========================================================
-DEVICE = "cpu"
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+
+# =========================================================
+# MODELS
+# =========================================================
 MODEL_FILES = {
-    "A0_full": "A0_full_best.pt",
-    "A1_no_moe": "A1_no_moe_best.pt",
-    "A2_no_saccade": "A2_no_saccade_best.pt",
-    "A3_no_lang": "A3_no_lang_best.pt",
-    "A4_simple": "A4_simple_best.pt",
+    "A0_baseline": "A0_baseline_best.pt",
+    "A1_lang_cond": "A1_lang_cond_best.pt",
+    "A2_hard_moe": "A2_hard_moe_best.pt",
+    "A3_hard_moe_lang": "A3_hard_moe_lang_best.pt",
+    "A4_soft_moe": "A4_soft_moe_best.pt",
 }
 
 
 # =========================================================
-# LEVENSHTEIN
+# FIXATION ACCURACY
+# =========================================================
+def fixation_accuracy(pred, gold, mask):
+    correct = (pred == gold).float()
+    return (correct * mask).sum() / mask.sum()
+
+
+# =========================================================
+# NORMALIZED LEVENSHTEIN (SCANPATH SIMILARITY)
 # =========================================================
 def levenshtein(a, b):
     n, m = len(a), len(b)
-
     dp = [[0] * (m + 1) for _ in range(n + 1)]
 
     for i in range(n + 1):
@@ -37,7 +48,6 @@ def levenshtein(a, b):
     for i in range(1, n + 1):
         for j in range(1, m + 1):
             cost = 0 if a[i - 1] == b[j - 1] else 1
-
             dp[i][j] = min(
                 dp[i - 1][j] + 1,
                 dp[i][j - 1] + 1,
@@ -47,141 +57,84 @@ def levenshtein(a, b):
     return dp[n][m]
 
 
-# =========================================================
-# DTW (Dynamic Time Warping)
-# =========================================================
-def dtw_distance(a, b):
-    n, m = len(a), len(b)
-
-    dtw = [[float("inf")] * (m + 1) for _ in range(n + 1)]
-    dtw[0][0] = 0
-
-    for i in range(1, n + 1):
-        for j in range(1, m + 1):
-            cost = abs(a[i - 1] - b[j - 1])
-            dtw[i][j] = cost + min(
-                dtw[i - 1][j],
-                dtw[i][j - 1],
-                dtw[i - 1][j - 1]
-            )
-
-    return dtw[n][m]
+def normalized_levenshtein(pred, gold):
+    return levenshtein(pred, gold) / max(len(gold), 1)
 
 
 # =========================================================
-# METRICS
+# REGRESSION RATE (COGNITIVE PROXY)
 # =========================================================
-def compute_metrics(logits, dur_pred, batch):
+def regression_rate(seq):
+    if len(seq) < 2:
+        return 0.0
+    jumps = torch.diff(torch.tensor(seq))
+    return (jumps < 0).float().mean().item()
 
-    B, T, V = logits.shape
-    mask = batch["mask"]
 
-    pred = logits.argmax(dim=-1)
+# =========================================================
+# DURATION METRICS (LOG SPACE STANDARD IN PSYCHOLINGUISTICS)
+# =========================================================
+def duration_metrics(pred_dur, gold_dur, mask):
 
-    # -------------------------
-    # Accuracy
-    # -------------------------
-    correct = (pred == batch["scanpath"]).float()
-    acc = (correct * mask).sum() / mask.sum()
+    pred = torch.log1p(pred_dur)
+    gold = torch.log1p(gold_dur)
 
-    # -------------------------
-    # Fixation loss
-    # -------------------------
-    fix_loss = F.cross_entropy(
-        logits.view(B * T, V),
-        batch["scanpath"].view(B * T),
-        reduction="none"
-    ).view(B, T)
-
-    fix_loss = (fix_loss * mask).sum() / mask.sum()
-
-    # -------------------------
-    # Duration loss
-    # -------------------------
-    dur_loss = F.mse_loss(
-        torch.log1p(dur_pred),
-        torch.log1p(batch["durations"]),
-        reduction="none"
-    )
-
-    dur_loss = (dur_loss * mask).sum() / mask.sum()
-
-    # -------------------------
-    # Saccade error
-    # -------------------------
-    pred_jump = pred[:, 1:] - pred[:, :-1]
-    true_jump = batch["scanpath"][:, 1:] - batch["scanpath"][:, :-1]
-
-    jump_mask = mask[:, 1:]
-
-    sacc_err = torch.abs(pred_jump - true_jump).float()
-    sacc_err = (sacc_err * jump_mask).sum() / jump_mask.sum()
-
-    # -------------------------
-    # Sequence metrics
-    # -------------------------
-    lev_total = 0
-    dtw_total = 0
-    reg_pred_total = 0
-    reg_true_total = 0
-    count = 0
-
-    pred_seq = pred.cpu().tolist()
-    true_seq = batch["scanpath"].cpu().tolist()
-    mask_seq = mask.cpu().tolist()
-
-    for p, t, m in zip(pred_seq, true_seq, mask_seq):
-
-        L = int(sum(m))
-
-        p = p[:L]
-        t = t[:L]
-
-        # Levenshtein
-        lev = levenshtein(p, t) / max(len(t), 1)
-
-        # DTW
-        dtw = dtw_distance(p, t) / max(len(t), 1)
-
-        # Regression rate (backward movements)
-        def regression_rate(seq):
-            if len(seq) < 2:
-                return 0
-            jumps = [seq[i] - seq[i - 1] for i in range(1, len(seq))]
-            reg = sum(1 for j in jumps if j < 0)
-            return reg / len(jumps)
-
-        reg_pred = regression_rate(p)
-        reg_true = regression_rate(t)
-
-        lev_total += lev
-        dtw_total += dtw
-        reg_pred_total += reg_pred
-        reg_true_total += reg_true
-
-        count += 1
+    mse = ((pred - gold) ** 2 * mask).sum() / mask.sum()
+    mae = (torch.abs(pred - gold) * mask).sum() / mask.sum()
 
     return {
-        "acc": acc.item(),
-        "fix_loss": fix_loss.item(),
-        "dur_loss": dur_loss.item(),
-        "saccade_error": sacc_err.item(),
-        "levenshtein": lev_total / count,
-        "dtw": dtw_total / count,
-        "reg_pred": reg_pred_total / count,
-        "reg_true": reg_true_total / count,
+        "dur_mse": mse.item(),
+        "dur_mae": mae.item()
     }
 
 
 # =========================================================
-# EVALUATE
+# FULL BATCH EVALUATION
+# =========================================================
+def evaluate_batch(pred, gold, mask, pred_dur, gold_dur):
+
+    B = pred.size(0)
+
+    acc = fixation_accuracy(pred, gold, mask)
+
+    lev_total = 0
+    reg_p = 0
+    reg_g = 0
+
+    for i in range(B):
+        L = int(mask[i].sum().item())
+
+        p = pred[i][:L].tolist()
+        g = gold[i][:L].tolist()
+
+        lev_total += normalized_levenshtein(p, g)
+        reg_p += regression_rate(p)
+        reg_g += regression_rate(g)
+
+    lev = lev_total / B
+    reg_p /= B
+    reg_g /= B
+
+    dur = duration_metrics(pred_dur, gold_dur, mask)
+
+    return {
+        "accuracy": acc.item(),
+        "levenshtein": lev,
+        "regression_pred": reg_p,
+        "regression_true": reg_g,
+        **dur
+    }
+
+
+# =========================================================
+# EVALUATION LOOP
 # =========================================================
 def evaluate(model, loader):
 
     model.eval()
 
     totals = None
-    count = 0
+    steps = 0
 
     with torch.no_grad():
         for batch in loader:
@@ -192,25 +145,35 @@ def evaluate(model, loader):
             }
 
             logits, dur_pred, _ = model(
-                batch["sentences"],
+                batch["input_ids"],
+                batch["attention_mask"],
+                batch["word_ids"],
                 batch["scanpath"],
                 batch["durations"],
                 batch["family"],
-                torch.zeros(len(batch["family"]), dtype=torch.long, device=DEVICE)
+                batch["lang_id"]
             )
 
-            metrics = compute_metrics(logits, dur_pred, batch)
+            pred = logits.argmax(dim=-1)
+
+            metrics = evaluate_batch(
+                pred,
+                batch["scanpath"],
+                batch["mask"],
+                dur_pred,
+                batch["durations"]
+            )
 
             if totals is None:
-                totals = {k: 0 for k in metrics}
+                totals = {k: 0.0 for k in metrics}
 
             for k in metrics:
                 totals[k] += metrics[k]
 
-            count += 1
+            steps += 1
 
     for k in totals:
-        totals[k] /= count
+        totals[k] /= steps
 
     return totals
 
@@ -220,15 +183,15 @@ def evaluate(model, loader):
 # =========================================================
 def load_model(name, path):
 
-    cfg_map = {
-        "A0_full": dict(use_moe=True, use_saccade=True, use_lang=True),
-        "A1_no_moe": dict(use_moe=False, use_saccade=True, use_lang=True),
-        "A2_no_saccade": dict(use_moe=True, use_saccade=False, use_lang=True),
-        "A3_no_lang": dict(use_moe=True, use_saccade=True, use_lang=False),
-        "A4_simple": dict(use_moe=False, use_saccade=False, use_lang=False),
-    }
+    cfg = {
+        "A0_baseline": dict(use_experts=False, routing="none", use_lang=False),
+        "A1_lang_cond": dict(use_experts=False, routing="none", use_lang=True),
+        "A2_hard_moe": dict(use_experts=True, routing="hard", use_lang=False),
+        "A3_hard_moe_lang": dict(use_experts=True, routing="hard", use_lang=True),
+        "A4_soft_moe": dict(use_experts=True, routing="soft", use_lang=False),
+    }[name]
 
-    model = EyeXpertXLMR(**cfg_map[name])
+    model = EyeXpertM(**cfg)
     model.load_state_dict(torch.load(path, map_location=DEVICE))
     model.to(DEVICE)
 
@@ -240,10 +203,9 @@ def load_model(name, path):
 # =========================================================
 if __name__ == "__main__":
 
-    print("Loading TEST dataset...")
+    print("Loading test set...")
 
-    test_data = json.load(open("meco_test.json", "r", encoding="utf-8"))
-    test_data = test_data[:100]
+    test_data = json.load(open("meco_test.json", "r", encoding="utf-8"))[:100]
 
     loader = DataLoader(
         MECO(test_data),
@@ -260,15 +222,13 @@ if __name__ == "__main__":
 
         model = load_model(name, path)
 
-        m = evaluate(model, loader)
+        metrics = evaluate(model, loader)
 
         print(f"\n{name}")
-        print(f"  Accuracy        : {m['acc']:.4f}")
-        print(f"  Fix Loss        : {m['fix_loss']:.4f}")
-        print(f"  Duration Loss   : {m['dur_loss']:.4f}")
-        print(f"  Saccade Error   : {m['saccade_error']:.4f}")
-        print(f"  Levenshtein     : {m['levenshtein']:.4f}")
-        print(f"  DTW             : {m['dtw']:.4f}")
-        print(f"  Reg (pred)      : {m['reg_pred']:.4f}")
-        print(f"  Reg (true)      : {m['reg_true']:.4f}")
+        print(f"  Accuracy        : {metrics['accuracy']:.4f}")
+        print(f"  Levenshtein     : {metrics['levenshtein']:.4f}")
+        print(f"  Regression (P)  : {metrics['regression_pred']:.4f}")
+        print(f"  Regression (T)  : {metrics['regression_true']:.4f}")
+        print(f"  Duration MSE    : {metrics['dur_mse']:.4f}")
+        print(f"  Duration MAE    : {metrics['dur_mae']:.4f}")
         print("")
