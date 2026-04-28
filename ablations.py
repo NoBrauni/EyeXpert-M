@@ -14,14 +14,10 @@ from train_meco import MECO, collate
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Device:", DEVICE)
 
-
-# =========================================================
-# SPEED SETTINGS (GPU ONLY)
-# =========================================================
 torch.backends.cudnn.benchmark = True
 
 USE_AMP = DEVICE.type == "cuda"
-scaler = torch.cuda.amp.GradScaler() if USE_AMP else None
+scaler = torch.amp.GradScaler("cuda", enabled=USE_AMP)
 
 
 # =========================================================
@@ -38,13 +34,11 @@ def set_seed(seed=42):
 # DATA SPLIT
 # =========================================================
 def split_data(data, seed=42):
-
     set_seed(seed)
     data = data.copy()
     random.shuffle(data)
 
     n = len(data)
-
     train_end = int(0.7 * n)
     val_end = int(0.85 * n)
 
@@ -61,37 +55,46 @@ def split_data(data, seed=42):
 
 
 # =========================================================
-# ABLATIONS
+# ABLATIONS (CLEAN FACTORIAL DESIGN)
 # =========================================================
 ABLATIONS = {
-
+    # baseline
     "A0_baseline": dict(use_experts=False, routing="none", use_lang=False),
-    "A1_lang_cond": dict(use_experts=False, routing="none", use_lang=True),
-    "A2_hard_moe": dict(use_experts=True, routing="hard", use_lang=False),
-    "A3_hard_moe_lang": dict(use_experts=True, routing="hard", use_lang=True),
-    "A4_soft_moe": dict(use_experts=True, routing="soft", use_lang=False),
+
+    # language effect only
+    "A1_lang": dict(use_experts=False, routing="none", use_lang=True),
+
+    # MoE effect (hard routing)
+    "A2_hard_moe": dict(use_experts=True, routing="hard", use_lang=True),
+
+    # routing comparison (soft)
+    "A3_soft_moe": dict(use_experts=True, routing="soft", use_lang=True),
 }
 
 
 # =========================================================
-# LOSS (UNCHANGED SCIENTIFIC BEHAVIOR)
+# LOSS FUNCTION
 # =========================================================
 def loss_fn(logits, dur_pred, moe_loss, batch):
 
     B, T, V = logits.shape
+    mask = batch["mask"].to(logits.device)
 
-    # FIXATION LOSS (masked)
+    # -------------------------
+    # FIXATION LOSS (PRIMARY)
+    # -------------------------
     fix = F.cross_entropy(
         logits.view(B * T, V),
         batch["scanpath"].view(B * T),
         reduction="none"
     ).view(B, T)
 
-    mask = batch["mask"].to(logits.device)
     fix = (fix * mask).sum() / mask.sum()
 
-    # DURATION LOSS (log-space)
-    target_dur = torch.log1p(batch["durations"])
+    # -------------------------
+    # DURATION LOSS (AUXILIARY, ALWAYS USED)
+    # -------------------------
+    target_dur = torch.log1p(batch["durations"]).to(logits.device)
 
     dur_loss = F.mse_loss(
         dur_pred.squeeze(-1),
@@ -101,17 +104,21 @@ def loss_fn(logits, dur_pred, moe_loss, batch):
 
     dur_loss = (dur_loss * mask).sum() / mask.sum()
 
-    # MOE LOSS
+    # -------------------------
+    # MOE LOSS (REGULARIZER)
+    # -------------------------
     moe = moe_loss if torch.is_tensor(moe_loss) else torch.tensor(0.0, device=logits.device)
 
-    return fix + 0.1 * dur_loss + 0.01 * moe
+    # -------------------------
+    # FIXED MULTI-TASK WEIGHTING (IMPORTANT FOR THESIS)
+    # -------------------------
+    return fix + 0.2 * dur_loss + 0.01 * moe
 
 
 # =========================================================
-# FORWARD (DEVICE SAFE)
+# FORWARD PASS
 # =========================================================
 def forward(model, batch):
-
     return model(
         batch["input_ids"].to(DEVICE),
         batch["attention_mask"].to(DEVICE),
@@ -119,24 +126,27 @@ def forward(model, batch):
         batch["scanpath"].to(DEVICE),
         batch["durations"].to(DEVICE),
         batch["family"].to(DEVICE),
-        batch["lang_id"].to(DEVICE)
+        batch["lang_id"].to(DEVICE),
     )
 
 
 # =========================================================
-# TRAIN STEP (AMP ENABLED)
+# TRAIN STEP
 # =========================================================
 def train_step(model, batch, optim):
 
-    optim.zero_grad()
+    optim.zero_grad(set_to_none=True)
 
     if USE_AMP:
-        with torch.cuda.amp.autocast():
+        with torch.autocast("cuda"):
 
             logits, dur_pred, moe = forward(model, batch)
             loss = loss_fn(logits, dur_pred, moe, batch)
 
         scaler.scale(loss).backward()
+        scaler.unscale_(optim)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
         scaler.step(optim)
         scaler.update()
 
@@ -147,18 +157,20 @@ def train_step(model, batch, optim):
         loss = loss_fn(logits, dur_pred, moe, batch)
 
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optim.step()
 
         return loss.item()
 
 
 # =========================================================
-# EVAL
+# EVALUATION
 # =========================================================
 def evaluate(model, loader):
 
     model.eval()
-    total = 0
+    total_loss = 0.0
+    total_count = 0.0
 
     with torch.no_grad():
         for batch in loader:
@@ -166,10 +178,12 @@ def evaluate(model, loader):
             logits, dur_pred, moe = forward(model, batch)
             loss = loss_fn(logits, dur_pred, moe, batch)
 
-            total += loss.item()
+            bs = batch["mask"].sum().item()
+            total_loss += loss.item() * bs
+            total_count += bs
 
     model.train()
-    return total / len(loader)
+    return total_loss / max(total_count, 1.0)
 
 
 # =========================================================
@@ -185,7 +199,7 @@ def train(model, train_loader, val_loader, name, epochs=3):
 
     for ep in range(epochs):
 
-        total = 0
+        total = 0.0
 
         for i, batch in enumerate(train_loader):
 
@@ -208,7 +222,7 @@ def train(model, train_loader, val_loader, name, epochs=3):
 
 
 # =========================================================
-# ABLATION RUNNER
+# RUN ABLATION
 # =========================================================
 def run_ablation(name, cfg, train_loader, val_loader):
 
@@ -219,7 +233,8 @@ def run_ablation(name, cfg, train_loader, val_loader):
     model = EyeXpertM(
         use_experts=cfg["use_experts"],
         routing=cfg["routing"],
-        use_lang=cfg["use_lang"]
+        use_lang=cfg["use_lang"],
+        use_duration=True  # ALWAYS ENABLED (core design choice)
     )
 
     train(model, train_loader, val_loader, name)

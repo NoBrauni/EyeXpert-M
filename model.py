@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from transformers import XLMRobertaModel
 
 
@@ -17,7 +16,7 @@ LANG_FAMILY = {
 
 
 # =========================================================
-# ENCODER (unchanged, already optimized)
+# ENCODER (unchanged)
 # =========================================================
 class Encoder(nn.Module):
     def __init__(self):
@@ -42,7 +41,8 @@ class Encoder(nn.Module):
         B, S, H = hidden.shape
         device = hidden.device
 
-        word_ids = torch.tensor(word_ids_batch, dtype=torch.long, device=device)
+        # FIX: avoid warning
+        word_ids = torch.as_tensor(word_ids_batch, device=device, dtype=torch.long)
 
         hidden_flat = hidden.reshape(B * S, H)
         word_ids_flat = word_ids.reshape(B * S)
@@ -93,7 +93,7 @@ class Encoder(nn.Module):
 
 
 # =========================================================
-# DECODER (VECTORIZED TIME UNROLLING)
+# DECODER (NO DURATION ANYMORE)
 # =========================================================
 class Decoder(nn.Module):
 
@@ -125,16 +125,12 @@ class Decoder(nn.Module):
         self.family_emb = nn.Embedding(10, hidden)
 
         self.query = nn.Linear(hidden, hidden)
-        self.duration_head = nn.Linear(hidden, 1)
 
         self.moe_loss = torch.tensor(0.0)
 
     def hard_route(self, family):
         return family % len(self.experts)
 
-    # =====================================================
-    # VECTORIZED FORWARD (NO PYTHON TIME LOOP)
-    # =====================================================
     def forward(self, memory, scanpath, durations, family, lang_id):
 
         B, W, H = memory.shape
@@ -146,68 +142,91 @@ class Decoder(nn.Module):
         if self.use_lang:
             context = self.lang_emb(lang_id) + self.family_emb(family)
 
-        outputs = []
-        duration_outputs = []
-        router_history = []
-
         zero_sacc = torch.zeros(B, 2, device=memory.device)
         zero_dur = torch.zeros(B, 1, device=memory.device)
 
         states = []
 
-        # =====================================================
-        # STEP 1: BUILD ALL STATES IN ONE PASS (UNROLLED LOOP)
-        # =====================================================
         for t in range(T):
 
-            if t == 0:
-                prev_idx = torch.zeros(B, dtype=torch.long, device=memory.device)
-            else:
-                prev_idx = scanpath[:, t - 1]
+            prev_idx = scanpath[:, t - 1] if t > 0 else torch.zeros(
+                B, dtype=torch.long, device=memory.device
+            )
 
             prev_word = memory[torch.arange(B, device=memory.device), prev_idx]
 
             prev_dur = torch.log1p(durations[:, t - 1]).unsqueeze(-1) if t > 0 else zero_dur
 
-            sacc = zero_sacc
-
-            inp = self.input_proj(torch.cat([prev_word, sacc, prev_dur], dim=-1))
+            inp = self.input_proj(torch.cat([prev_word, zero_sacc, prev_dur], dim=-1))
 
             state = self.rnn(inp, state) if self.use_rnn else inp
-            state = state + context
 
+            # -------- MoE --------
+            if self.use_experts:
+                if self.routing == "soft":
+                    w = torch.softmax(self.router(state), dim=-1)
+                    new_state = 0
+                    for i, expert in enumerate(self.experts):
+                        new_state += w[:, i].unsqueeze(-1) * expert(state, state)
+                    state = new_state
+
+                elif self.routing == "hard":
+                    idx = self.hard_route(family)
+                    new_state = torch.zeros_like(state)
+                    for i, expert in enumerate(self.experts):
+                        mask = (idx == i).float().unsqueeze(-1)
+                        new_state += mask * expert(state, state)
+                    state = new_state
+
+            state = state + context
             states.append(state)
 
-        # stack full sequence
         states = torch.stack(states, dim=1)  # (B, T, H)
 
-        # =====================================================
-        # STEP 2: PARALLEL FIXATION PREDICTION
-        # =====================================================
-        q = self.query(states)  # (B, T, H)
-
+        # fixation logits
+        q = self.query(states)
         logits = torch.einsum("bth,bwh->btw", q, memory)
-        outputs = logits
 
-        # =====================================================
-        # STEP 3: PARALLEL DURATION PREDICTION
-        # =====================================================
-        dur_pred = self.duration_head(states)
-
-        # =====================================================
-        # STEP 4: MoE LOSS (UNCHANGED LOGIC)
-        # =====================================================
+        # MoE entropy loss
         if self.use_experts and self.routing == "soft":
-
             r = torch.softmax(self.router(states), dim=-1)
             p = r.mean(dim=(0, 1))
             self.moe_loss = -(p * torch.log(p + 1e-8)).sum()
 
-        return outputs, dur_pred
+        return logits, states
 
 
 # =========================================================
-# FULL MODEL
+# SEPARATE DURATION HEAD
+# =========================================================
+class DurationHead(nn.Module):
+
+    def __init__(self, hidden, use_lang=True):
+        super().__init__()
+
+        self.use_lang = use_lang
+
+        if use_lang:
+            self.lang_emb = nn.Embedding(10, hidden)
+            self.family_emb = nn.Embedding(10, hidden)
+
+        self.net = nn.Sequential(
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, 1)
+        )
+
+    def forward(self, states, family=None, lang_id=None):
+
+        if self.use_lang:
+            context = self.lang_emb(lang_id) + self.family_emb(family)
+            states = states + context.unsqueeze(1)
+
+        return self.net(states)
+
+
+# =========================================================
+# FULL MODEL (EyeXpert-M)
 # =========================================================
 class EyeXpertM(nn.Module):
 
@@ -215,9 +234,13 @@ class EyeXpertM(nn.Module):
                  use_experts=True,
                  routing="none",
                  use_lang=True,
-                 use_rnn=True):
+                 use_rnn=True,
+                 use_duration=True,
+                 duration_lang=True):
 
         super().__init__()
+
+        self.use_duration = use_duration
 
         self.encoder = Encoder()
         hidden = self.encoder.model.config.hidden_size
@@ -230,6 +253,12 @@ class EyeXpertM(nn.Module):
             use_rnn=use_rnn
         )
 
+        if use_duration:
+            self.duration_head = DurationHead(
+                hidden,
+                use_lang=duration_lang
+            )
+
     def forward(self,
                 input_ids,
                 attention_mask,
@@ -241,12 +270,17 @@ class EyeXpertM(nn.Module):
 
         memory = self.encoder(input_ids, attention_mask, word_ids)
 
-        logits, dur_pred = self.decoder(
+        logits, states = self.decoder(
             memory,
             scanpath,
             durations,
             family,
             lang_id
         )
+
+        if self.use_duration:
+            dur_pred = self.duration_head(states.detach(), family, lang_id)
+        else:
+            dur_pred = None
 
         return logits, dur_pred, self.decoder.moe_loss

@@ -5,8 +5,6 @@ from transformers import XLMRobertaTokenizerFast
 
 from model import LANG_FAMILY
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
 tokenizer = XLMRobertaTokenizerFast.from_pretrained("xlm-roberta-base")
 
 
@@ -32,20 +30,25 @@ class MECO(Dataset):
         )
 
         # -------------------------
-        # CLEAN WORD IDS HERE (IMPORTANT FIX)
+        # WORD IDS (CLEAN)
         # -------------------------
         word_ids = enc.word_ids(batch_index=0)
         word_ids = [-1 if x is None else x for x in word_ids]
+
+        # -------------------------
+        # REQUIRED SIGNALS (NO OPTIONAL MODES)
+        # -------------------------
+        scanpath = torch.tensor(item["scanpath"], dtype=torch.long)
+        durations = torch.tensor(item["durations"], dtype=torch.float)
 
         return {
             "input_ids": enc["input_ids"].squeeze(0),
             "attention_mask": enc["attention_mask"].squeeze(0),
 
-            # now already clean tensor (no None anymore)
             "word_ids": torch.tensor(word_ids, dtype=torch.long),
 
-            "scanpath": torch.tensor(item["scanpath"], dtype=torch.long),
-            "durations": torch.tensor(item["durations"], dtype=torch.float),
+            "scanpath": scanpath,
+            "durations": durations,
 
             "family": torch.tensor(LANG_FAMILY[item["lang"]], dtype=torch.long),
             "lang_id": torch.tensor(0)
@@ -53,7 +56,7 @@ class MECO(Dataset):
 
 
 # =========================================================
-# COLLATE (GPU-READY, CLEAN, MINIMAL OVERHEAD)
+# COLLATE FUNCTION (CLEAN + GPU SAFE)
 # =========================================================
 def collate(batch):
 
@@ -65,29 +68,29 @@ def collate(batch):
     input_ids = [b["input_ids"] for b in batch]
     attn = [b["attention_mask"] for b in batch]
 
-    input_ids = rnn.pad_sequence(input_ids, batch_first=True, padding_value=0)
-    attn = rnn.pad_sequence(attn, batch_first=True, padding_value=0)
-
-    out["input_ids"] = input_ids
-    out["attention_mask"] = attn
+    out["input_ids"] = rnn.pad_sequence(input_ids, batch_first=True, padding_value=0)
+    out["attention_mask"] = rnn.pad_sequence(attn, batch_first=True, padding_value=0)
 
     # -------------------------
-    # WORD IDS (ALREADY CLEAN)
+    # WORD IDS
     # -------------------------
     word_ids = [b["word_ids"] for b in batch]
     out["word_ids"] = rnn.pad_sequence(word_ids, batch_first=True, padding_value=-1)
 
     # -------------------------
-    # SCANPATH + DURATIONS
+    # SCANPATH
     # -------------------------
     scan = [b["scanpath"] for b in batch]
-    dur = [b["durations"] for b in batch]
-
     out["scanpath"] = rnn.pad_sequence(scan, batch_first=True, padding_value=0)
-    out["durations"] = rnn.pad_sequence(dur, batch_first=True, padding_value=0)
 
     # -------------------------
-    # MASK (IMPORTANT FOR LOSS)
+    # DURATIONS (ALWAYS PRESENT)
+    # -------------------------
+    dur = [b["durations"] for b in batch]
+    out["durations"] = rnn.pad_sequence(dur, batch_first=True, padding_value=0.0)
+
+    # -------------------------
+    # MASK (for loss weighting)
     # -------------------------
     lengths = [len(b["scanpath"]) for b in batch]
     max_len = max(lengths)
@@ -100,7 +103,7 @@ def collate(batch):
     out["mask"] = mask
 
     # -------------------------
-    # META
+    # META DATA
     # -------------------------
     out["family"] = torch.tensor([b["family"] for b in batch], dtype=torch.long)
     out["lang_id"] = torch.tensor([b["lang_id"] for b in batch], dtype=torch.long)
