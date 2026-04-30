@@ -9,19 +9,32 @@ from train_meco import MECO, collate
 
 
 # =========================================================
-# DEVICE
+# DEVICE + SPEED SETTINGS
 # =========================================================
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Device:", DEVICE)
 
 torch.backends.cudnn.benchmark = True
+torch.set_float32_matmul_precision("high")
 
 USE_AMP = DEVICE.type == "cuda"
 scaler = torch.amp.GradScaler("cuda", enabled=USE_AMP)
 
 
 # =========================================================
-# REPRODUCIBILITY
+# HYPERPARAMETERS
+# =========================================================
+LR = 1e-4
+BATCH_SIZE = 2
+
+ACCUM_STEPS = 4   # 🔥 simulated batch size = 8
+
+LAMBDA_DUR_MAX = 0.01
+MOE_LAMBDA = 0.01
+
+
+# =========================================================
+# SEED
 # =========================================================
 def set_seed(seed=42):
     random.seed(seed)
@@ -31,7 +44,7 @@ def set_seed(seed=42):
 
 
 # =========================================================
-# DATA SPLIT
+# SPLIT
 # =========================================================
 def split_data(data, seed=42):
     set_seed(seed)
@@ -42,172 +55,140 @@ def split_data(data, seed=42):
     train_end = int(0.7 * n)
     val_end = int(0.85 * n)
 
-    train_data = data[:train_end]
-    val_data = data[train_end:val_end]
-    test_data = data[val_end:]
-
-    print("Dataset split:")
-    print("Train:", len(train_data))
-    print("Val  :", len(val_data))
-    print("Test :", len(test_data))
-
-    return train_data, val_data, test_data
+    return data[:train_end], data[train_end:val_end], data[val_end:]
 
 
 # =========================================================
-# ABLATIONS (CLEAN FACTORIAL DESIGN)
+# ABLATIONS
 # =========================================================
 ABLATIONS = {
-    # baseline
     "A0_baseline": dict(use_experts=False, routing="none", use_lang=False),
-
-    # language effect only
     "A1_lang": dict(use_experts=False, routing="none", use_lang=True),
-
-    # MoE effect (hard routing)
     "A2_hard_moe": dict(use_experts=True, routing="hard", use_lang=True),
-
-    # routing comparison (soft)
     "A3_soft_moe": dict(use_experts=True, routing="soft", use_lang=True),
+    "A4_single_expert": dict(use_experts=True, routing="hard", use_lang=True, n_experts=1),
 }
 
 
 # =========================================================
-# LOSS FUNCTION
+# DIAGNOSTICS
 # =========================================================
-def loss_fn(logits, dur_pred, moe_loss, batch):
+def log_moe_stats(moe, name, step):
+    if moe is None or moe.get("probs", None) is None:
+        return
+
+    with torch.no_grad():
+        probs = moe["probs"]
+
+        entropy = -(probs * torch.log(probs + 1e-8)).sum(dim=-1).mean()
+        usage = probs.mean(dim=(0, 1))
+
+        print(
+            f"[{name} step {step}] "
+            f"entropy={entropy.item():.3f} | "
+            f"max_usage={usage.max().item():.3f}"
+        )
+
+
+# =========================================================
+# LOSS
+# =========================================================
+def loss_fn(logits, dur_pred, moe, batch, lambda_dur):
 
     B, T, V = logits.shape
     mask = batch["mask"].to(logits.device)
 
-    # -------------------------
-    # FIXATION LOSS (PRIMARY)
-    # -------------------------
     fix = F.cross_entropy(
         logits.view(B * T, V),
-        batch["scanpath"].view(B * T),
+        batch["scanpath"].view(B * T).to(logits.device),
         reduction="none"
     ).view(B, T)
 
     fix = (fix * mask).sum() / mask.sum()
 
-    # -------------------------
-    # DURATION LOSS (AUXILIARY, ALWAYS USED)
-    # -------------------------
     target_dur = torch.log1p(batch["durations"]).to(logits.device)
 
-    dur_loss = F.mse_loss(
+    dur = F.mse_loss(
         dur_pred.squeeze(-1),
         target_dur,
         reduction="none"
     )
 
-    dur_loss = (dur_loss * mask).sum() / mask.sum()
+    dur = (dur * mask).sum() / mask.sum()
 
-    # -------------------------
-    # MOE LOSS (REGULARIZER)
-    # -------------------------
-    moe = moe_loss if torch.is_tensor(moe_loss) else torch.tensor(0.0, device=logits.device)
+    moe_loss = 0.0
+    if moe is not None and moe.get("loss") is not None:
+        moe_loss = moe["loss"]
 
-    # -------------------------
-    # FIXED MULTI-TASK WEIGHTING (IMPORTANT FOR THESIS)
-    # -------------------------
-    return fix + 0.2 * dur_loss + 0.01 * moe
+    return fix + lambda_dur * dur + MOE_LAMBDA * moe_loss
 
 
 # =========================================================
-# FORWARD PASS
+# FORWARD
 # =========================================================
 def forward(model, batch):
+    batch = {k: v.to(DEVICE) if torch.is_tensor(v) else v for k, v in batch.items()}
+
     return model(
-        batch["input_ids"].to(DEVICE),
-        batch["attention_mask"].to(DEVICE),
-        batch["word_ids"].to(DEVICE),
-        batch["scanpath"].to(DEVICE),
-        batch["durations"].to(DEVICE),
-        batch["family"].to(DEVICE),
-        batch["lang_id"].to(DEVICE),
+        batch["input_ids"],
+        batch["attention_mask"],
+        batch["word_ids"],
+        batch["scanpath"],
+        batch["durations"],
+        batch["family"],
+        batch["lang_id"],
     )
 
 
 # =========================================================
-# TRAIN STEP
-# =========================================================
-def train_step(model, batch, optim):
-
-    optim.zero_grad(set_to_none=True)
-
-    if USE_AMP:
-        with torch.autocast("cuda"):
-
-            logits, dur_pred, moe = forward(model, batch)
-            loss = loss_fn(logits, dur_pred, moe, batch)
-
-        scaler.scale(loss).backward()
-        scaler.unscale_(optim)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-
-        scaler.step(optim)
-        scaler.update()
-
-        return loss.item()
-
-    else:
-        logits, dur_pred, moe = forward(model, batch)
-        loss = loss_fn(logits, dur_pred, moe, batch)
-
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optim.step()
-
-        return loss.item()
-
-
-# =========================================================
-# EVALUATION
-# =========================================================
-def evaluate(model, loader):
-
-    model.eval()
-    total_loss = 0.0
-    total_count = 0.0
-
-    with torch.no_grad():
-        for batch in loader:
-
-            logits, dur_pred, moe = forward(model, batch)
-            loss = loss_fn(logits, dur_pred, moe, batch)
-
-            bs = batch["mask"].sum().item()
-            total_loss += loss.item() * bs
-            total_count += bs
-
-    model.train()
-    return total_loss / max(total_count, 1.0)
-
-
-# =========================================================
-# TRAIN LOOP
+# TRAIN (WITH GRAD ACCUMULATION)
 # =========================================================
 def train(model, train_loader, val_loader, name, epochs=3):
 
     model.to(DEVICE)
-
-    optim = torch.optim.AdamW(model.parameters(), lr=2e-4)
+    optim = torch.optim.AdamW(model.parameters(), lr=LR)
 
     best_val = float("inf")
 
     for ep in range(epochs):
 
+        model.train()
         total = 0.0
+        optim.zero_grad(set_to_none=True)
+
+        lambda_dur = min(LAMBDA_DUR_MAX, (ep + 1) / 3 * LAMBDA_DUR_MAX)
 
         for i, batch in enumerate(train_loader):
 
-            loss = train_step(model, batch, optim)
-            total += loss
+            logits, dur_pred, moe = forward(model, batch)
 
-            if i % 20 == 0:
-                print(f"[{name}] Epoch {ep} Step {i} | Loss {loss:.4f}")
+            loss = loss_fn(logits, dur_pred, moe, batch, lambda_dur)
+            loss = loss / ACCUM_STEPS
+
+            if USE_AMP:
+                with torch.autocast("cuda"):
+                    scaler.scale(loss).backward()
+            else:
+                loss.backward()
+
+            # -------------------------
+            # STEP ONLY AFTER ACCUMULATION
+            # -------------------------
+            if (i + 1) % ACCUM_STEPS == 0:
+
+                if USE_AMP:
+                    scaler.step(optim)
+                    scaler.update()
+                else:
+                    optim.step()
+
+                optim.zero_grad(set_to_none=True)
+
+            total += loss.item() * ACCUM_STEPS
+
+            if i % 500 == 0:
+                print(f"[{name}] Epoch {ep} Step {i} | Loss {loss.item() * ACCUM_STEPS:.4f}")
+                log_moe_stats(moe, name, i)
 
         val_loss = evaluate(model, val_loader)
 
@@ -219,6 +200,37 @@ def train(model, train_loader, val_loader, name, epochs=3):
             best_val = val_loss
             torch.save(model.state_dict(), f"{name}_best.pt")
             print("✔ saved best model")
+
+
+# =========================================================
+# EVAL
+# =========================================================
+def evaluate(model, loader):
+
+    model.eval()
+    total = 0.0
+    count = 0.0
+
+    with torch.no_grad():
+        for batch in loader:
+
+            logits, _, _ = forward(model, batch)
+
+            B, T, V = logits.shape
+            mask = batch["mask"].to(logits.device)
+
+            loss = F.cross_entropy(
+                logits.view(B * T, V),
+                batch["scanpath"].view(B * T).to(logits.device),
+                reduction="none"
+            ).view(B, T)
+
+            loss = (loss * mask).sum()
+
+            total += loss.item()
+            count += mask.sum().item()
+
+    return total / max(count, 1.0)
 
 
 # =========================================================
@@ -234,7 +246,8 @@ def run_ablation(name, cfg, train_loader, val_loader):
         use_experts=cfg["use_experts"],
         routing=cfg["routing"],
         use_lang=cfg["use_lang"],
-        use_duration=True  # ALWAYS ENABLED (core design choice)
+        n_experts=cfg.get("n_experts", 5),
+        use_duration=True
     )
 
     train(model, train_loader, val_loader, name)
@@ -245,30 +258,30 @@ def run_ablation(name, cfg, train_loader, val_loader):
 # =========================================================
 if __name__ == "__main__":
 
-    print("Loading dataset...")
-
     data = json.load(open("meco_train.json", "r", encoding="utf-8"))
     data = data[:500]
 
-    train_data, val_data, test_data = split_data(data)
+    train_data, val_data, _ = split_data(data)
 
     train_loader = DataLoader(
         MECO(train_data),
-        batch_size=4,
+        batch_size=BATCH_SIZE,
         shuffle=True,
         collate_fn=collate,
-        pin_memory=True
+        pin_memory=True,
+        num_workers=2,
+        persistent_workers=True
     )
 
     val_loader = DataLoader(
         MECO(val_data),
-        batch_size=4,
+        batch_size=BATCH_SIZE,
         shuffle=False,
         collate_fn=collate,
-        pin_memory=True
+        pin_memory=True,
+        num_workers=2,
+        persistent_workers=True
     )
-
-    print("Starting ablations...\n")
 
     for name, cfg in ABLATIONS.items():
         run_ablation(name, cfg, train_loader, val_loader)

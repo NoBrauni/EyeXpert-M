@@ -29,38 +29,30 @@ class MECO(Dataset):
             return_tensors="pt"
         )
 
-        # -------------------------
-        # WORD IDS (CLEAN)
-        # -------------------------
+        # WORD IDS
         word_ids = enc.word_ids(batch_index=0)
         word_ids = [-1 if x is None else x for x in word_ids]
 
-        # -------------------------
-        # REQUIRED SIGNALS (NO OPTIONAL MODES)
-        # -------------------------
         scanpath = torch.tensor(item["scanpath"], dtype=torch.long)
         durations = torch.tensor(item["durations"], dtype=torch.float)
 
         return {
             "input_ids": enc["input_ids"].squeeze(0),
             "attention_mask": enc["attention_mask"].squeeze(0),
-
             "word_ids": torch.tensor(word_ids, dtype=torch.long),
 
             "scanpath": scanpath,
             "durations": durations,
 
             "family": torch.tensor(LANG_FAMILY[item["lang"]], dtype=torch.long),
-            "lang_id": torch.tensor(0)
+            "lang_id": torch.tensor(0, dtype=torch.long)
         }
 
 
 # =========================================================
-# COLLATE FUNCTION (CLEAN + GPU SAFE)
+# COLLATE FUNCTION (FIXED + STABLE)
 # =========================================================
 def collate(batch):
-
-    out = {}
 
     # -------------------------
     # TOKEN INPUTS
@@ -68,44 +60,51 @@ def collate(batch):
     input_ids = [b["input_ids"] for b in batch]
     attn = [b["attention_mask"] for b in batch]
 
-    out["input_ids"] = rnn.pad_sequence(input_ids, batch_first=True, padding_value=0)
-    out["attention_mask"] = rnn.pad_sequence(attn, batch_first=True, padding_value=0)
+    input_ids = rnn.pad_sequence(input_ids, batch_first=True, padding_value=0)
+    attention_mask = rnn.pad_sequence(attn, batch_first=True, padding_value=0)
 
     # -------------------------
     # WORD IDS
     # -------------------------
     word_ids = [b["word_ids"] for b in batch]
-    out["word_ids"] = rnn.pad_sequence(word_ids, batch_first=True, padding_value=-1)
+    word_ids = rnn.pad_sequence(word_ids, batch_first=True, padding_value=-1)
 
     # -------------------------
     # SCANPATH
     # -------------------------
-    scan = [b["scanpath"] for b in batch]
-    out["scanpath"] = rnn.pad_sequence(scan, batch_first=True, padding_value=0)
+    scanpath = [b["scanpath"] for b in batch]
+    scanpath = rnn.pad_sequence(scanpath, batch_first=True, padding_value=0)
 
     # -------------------------
-    # DURATIONS (ALWAYS PRESENT)
+    # DURATIONS (RAW, consistent with log1p in loss)
     # -------------------------
-    dur = [b["durations"] for b in batch]
-    out["durations"] = rnn.pad_sequence(dur, batch_first=True, padding_value=0.0)
+    durations = [b["durations"] for b in batch]
+    durations = rnn.pad_sequence(durations, batch_first=True, padding_value=0.0)
+
+    # OPTIONAL (recommended): stabilize scale slightly
+    # durations = torch.log1p(durations)
 
     # -------------------------
-    # MASK (for loss weighting)
+    # MASK (IMPORTANT FIX)
+    # derived from scanpath, not Python lengths
     # -------------------------
-    lengths = [len(b["scanpath"]) for b in batch]
-    max_len = max(lengths)
-
-    mask = torch.zeros(len(batch), max_len, dtype=torch.float)
-
-    for i, l in enumerate(lengths):
-        mask[i, :l] = 1.0
-
-    out["mask"] = mask
+    mask = (scanpath != 0).float()
 
     # -------------------------
     # META DATA
     # -------------------------
-    out["family"] = torch.tensor([b["family"] for b in batch], dtype=torch.long)
-    out["lang_id"] = torch.tensor([b["lang_id"] for b in batch], dtype=torch.long)
+    family = torch.tensor([b["family"] for b in batch], dtype=torch.long)
+    lang_id = torch.tensor([b["lang_id"] for b in batch], dtype=torch.long)
 
-    return out
+    return {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "word_ids": word_ids,
+
+        "scanpath": scanpath,
+        "durations": durations,
+        "mask": mask,
+
+        "family": family,
+        "lang_id": lang_id
+    }
