@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from model import EyeXpertM
-from train_meco import MECO, collate
+from train_meco import MECO, collate, tokenizer, GLOBAL_CACHE
 
 
 # =========================================================
@@ -26,8 +26,7 @@ scaler = torch.amp.GradScaler("cuda", enabled=USE_AMP)
 # =========================================================
 LR = 1e-4
 BATCH_SIZE = 2
-
-ACCUM_STEPS = 4   # 🔥 simulated batch size = 8
+ACCUM_STEPS = 4
 
 LAMBDA_DUR_MAX = 0.01
 MOE_LAMBDA = 0.01
@@ -71,29 +70,9 @@ ABLATIONS = {
 
 
 # =========================================================
-# DIAGNOSTICS
+# LOSS (UNCHANGED)
 # =========================================================
-def log_moe_stats(moe, name, step):
-    if moe is None or moe.get("probs", None) is None:
-        return
-
-    with torch.no_grad():
-        probs = moe["probs"]
-
-        entropy = -(probs * torch.log(probs + 1e-8)).sum(dim=-1).mean()
-        usage = probs.mean(dim=(0, 1))
-
-        print(
-            f"[{name} step {step}] "
-            f"entropy={entropy.item():.3f} | "
-            f"max_usage={usage.max().item():.3f}"
-        )
-
-
-# =========================================================
-# LOSS
-# =========================================================
-def loss_fn(logits, dur_pred, moe, batch, lambda_dur):
+def loss_fn(logits, dur_pred, moe_metrics, batch, lambda_dur):
 
     B, T, V = logits.shape
     mask = batch["mask"].to(logits.device)
@@ -117,8 +96,8 @@ def loss_fn(logits, dur_pred, moe, batch, lambda_dur):
     dur = (dur * mask).sum() / mask.sum()
 
     moe_loss = 0.0
-    if moe is not None and moe.get("loss") is not None:
-        moe_loss = moe["loss"]
+    if moe_metrics:
+        moe_loss = moe_metrics.get("load_balance", 0.0)
 
     return fix + lambda_dur * dur + MOE_LAMBDA * moe_loss
 
@@ -127,7 +106,7 @@ def loss_fn(logits, dur_pred, moe, batch, lambda_dur):
 # FORWARD
 # =========================================================
 def forward(model, batch):
-    batch = {k: v.to(DEVICE) if torch.is_tensor(v) else v for k, v in batch.items()}
+    batch = {k: v.to(DEVICE) for k, v in batch.items() if torch.is_tensor(v)}
 
     return model(
         batch["input_ids"],
@@ -141,7 +120,7 @@ def forward(model, batch):
 
 
 # =========================================================
-# TRAIN (WITH GRAD ACCUMULATION)
+# TRAIN (UNCHANGED)
 # =========================================================
 def train(model, train_loader, val_loader, name, epochs=3):
 
@@ -154,15 +133,16 @@ def train(model, train_loader, val_loader, name, epochs=3):
 
         model.train()
         total = 0.0
+
         optim.zero_grad(set_to_none=True)
 
         lambda_dur = min(LAMBDA_DUR_MAX, (ep + 1) / 3 * LAMBDA_DUR_MAX)
 
         for i, batch in enumerate(train_loader):
 
-            logits, dur_pred, moe = forward(model, batch)
+            logits, dur_pred, moe_metrics = forward(model, batch)
 
-            loss = loss_fn(logits, dur_pred, moe, batch, lambda_dur)
+            loss = loss_fn(logits, dur_pred, moe_metrics, batch, lambda_dur)
             loss = loss / ACCUM_STEPS
 
             if USE_AMP:
@@ -171,24 +151,15 @@ def train(model, train_loader, val_loader, name, epochs=3):
             else:
                 loss.backward()
 
-            # -------------------------
-            # STEP ONLY AFTER ACCUMULATION
-            # -------------------------
             if (i + 1) % ACCUM_STEPS == 0:
-
                 if USE_AMP:
                     scaler.step(optim)
                     scaler.update()
                 else:
                     optim.step()
-
                 optim.zero_grad(set_to_none=True)
 
             total += loss.item() * ACCUM_STEPS
-
-            if i % 500 == 0:
-                print(f"[{name}] Epoch {ep} Step {i} | Loss {loss.item() * ACCUM_STEPS:.4f}")
-                log_moe_stats(moe, name, i)
 
         val_loss = evaluate(model, val_loader)
 
@@ -199,7 +170,6 @@ def train(model, train_loader, val_loader, name, epochs=3):
         if val_loss < best_val:
             best_val = val_loss
             torch.save(model.state_dict(), f"{name}_best.pt")
-            print("✔ saved best model")
 
 
 # =========================================================
@@ -234,7 +204,7 @@ def evaluate(model, loader):
 
 
 # =========================================================
-# RUN ABLATION
+# RUN
 # =========================================================
 def run_ablation(name, cfg, train_loader, val_loader):
 
@@ -263,8 +233,11 @@ if __name__ == "__main__":
 
     train_data, val_data, _ = split_data(data)
 
+    train_dataset = MECO(train_data, tokenizer, GLOBAL_CACHE)
+    val_dataset = MECO(val_data, tokenizer, GLOBAL_CACHE)
+
     train_loader = DataLoader(
-        MECO(train_data),
+        train_dataset,
         batch_size=BATCH_SIZE,
         shuffle=True,
         collate_fn=collate,
@@ -274,7 +247,7 @@ if __name__ == "__main__":
     )
 
     val_loader = DataLoader(
-        MECO(val_data),
+        val_dataset,
         batch_size=BATCH_SIZE,
         shuffle=False,
         collate_fn=collate,
