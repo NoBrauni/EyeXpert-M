@@ -1,34 +1,36 @@
 import torch
-import torch.nn.utils.rnn as rnn
 from torch.utils.data import Dataset
+from torch.nn.utils.rnn import pad_sequence
 from transformers import XLMRobertaTokenizerFast
-
 from model import LANG_FAMILY
 
 tokenizer = XLMRobertaTokenizerFast.from_pretrained("xlm-roberta-base")
 
 
 # =========================================================
-# CACHE
+# ENCODING
 # =========================================================
-GLOBAL_CACHE = {}
-
-
-def encode_sentence(tokenizer, sentence):
+def encode(sentence):
     enc = tokenizer(
         sentence,
+        return_tensors="pt",
         truncation=True,
-        padding=False,
-        return_tensors="pt"
+        padding=False
     )
 
     word_ids = enc.word_ids(batch_index=0)
-    word_ids = [-1 if x is None else x for x in word_ids]
+    if word_ids is None:
+        word_ids = []
+
+    word_ids = torch.tensor(
+        [-1 if w is None else w for w in word_ids],
+        dtype=torch.long
+    )
 
     return {
         "input_ids": enc["input_ids"].squeeze(0),
         "attention_mask": enc["attention_mask"].squeeze(0),
-        "word_ids": torch.tensor(word_ids, dtype=torch.long),
+        "word_ids": word_ids,
     }
 
 
@@ -36,39 +38,33 @@ def encode_sentence(tokenizer, sentence):
 # DATASET
 # =========================================================
 class MECO(Dataset):
-    def __init__(self, data, tokenizer, cache=GLOBAL_CACHE):
+
+    def __init__(self, data):
         self.data = data
-        self.tokenizer = tokenizer
-        self.cache = cache
 
     def __len__(self):
         return len(self.data)
 
-    def __getitem__(self, i):
+    def __getitem__(self, idx):
 
-        item = self.data[i]
-        sentence = item["sentence"]
+        item = self.data[idx]
 
-        # -------------------------
-        # CACHE HIT / MISS
-        # -------------------------
-        if sentence in self.cache:
-            cached = self.cache[sentence]
-        else:
-            cached = encode_sentence(self.tokenizer, sentence)
-            self.cache[sentence] = cached
+        enc = encode(item["sentence"])
 
         scanpath = torch.tensor(item["scanpath"], dtype=torch.long)
         durations = torch.tensor(item["durations"], dtype=torch.float)
 
         return {
-            **cached,
-
+            **enc,
             "scanpath": scanpath,
             "durations": durations,
 
+            # language conditioning
             "family": torch.tensor(LANG_FAMILY[item["lang"]], dtype=torch.long),
-            "lang_id": torch.tensor(0, dtype=torch.long)
+            "lang_id": torch.tensor(0, dtype=torch.long),
+
+            # IMPORTANT: mask = valid timesteps
+            "scanpath_mask": torch.ones(len(scanpath), dtype=torch.float)
         }
 
 
@@ -77,35 +73,22 @@ class MECO(Dataset):
 # =========================================================
 def collate(batch):
 
-    input_ids = [b["input_ids"] for b in batch]
-    attn = [b["attention_mask"] for b in batch]
-
-    input_ids = rnn.pad_sequence(input_ids, batch_first=True, padding_value=0)
-    attention_mask = rnn.pad_sequence(attn, batch_first=True, padding_value=0)
-
-    word_ids = [b["word_ids"] for b in batch]
-    word_ids = rnn.pad_sequence(word_ids, batch_first=True, padding_value=-1)
-
-    scanpath = [b["scanpath"] for b in batch]
-    scanpath = rnn.pad_sequence(scanpath, batch_first=True, padding_value=0)
-
-    durations = [b["durations"] for b in batch]
-    durations = rnn.pad_sequence(durations, batch_first=True, padding_value=0.0)
-
-    mask = (scanpath != 0).float()
-
-    family = torch.tensor([b["family"] for b in batch], dtype=torch.long)
-    lang_id = torch.tensor([b["lang_id"] for b in batch], dtype=torch.long)
+    def pad(key, val):
+        return pad_sequence(
+            [b[key] for b in batch],
+            batch_first=True,
+            padding_value=val
+        )
 
     return {
-        "input_ids": input_ids,
-        "attention_mask": attention_mask,
-        "word_ids": word_ids,
+        "input_ids": pad("input_ids", 0),
+        "attention_mask": pad("attention_mask", 0),
+        "word_ids": pad("word_ids", -1),
 
-        "scanpath": scanpath,
-        "durations": durations,
-        "mask": mask,
+        "scanpath": pad("scanpath", 0),
+        "durations": pad("durations", 0.0),
+        "scanpath_mask": pad("scanpath_mask", 0.0),
 
-        "family": family,
-        "lang_id": lang_id
+        "family": torch.stack([b["family"] for b in batch]),
+        "lang_id": torch.stack([b["lang_id"] for b in batch]),
     }

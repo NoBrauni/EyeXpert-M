@@ -261,3 +261,130 @@ with open("meco_test.json", "w") as f:
 print("Saved:")
 print(" - meco_train.json")
 print(" - meco_test.json")
+
+# -----------------------------
+# VALIDATION & QUALITY METRICS
+# -----------------------------
+
+def validate_alignment_quality(df, aligned_samples):
+    """Validate alignment quality and report statistics."""
+    print("\n🔍 ALIGNMENT QUALITY VALIDATION")
+    print("="*50)
+
+    total_samples = len(aligned_samples)
+    total_fixations = sum(len(s["scanpath"]) for s in aligned_samples)
+
+    # Language coverage
+    lang_counts = defaultdict(int)
+    for s in aligned_samples:
+        lang_counts[s["lang"]] += 1
+
+    print(f"✓ Total aligned samples: {total_samples:,}")
+    print(f"✓ Total fixations: {total_fixations:,}")
+    print(".2f")
+
+    # Alignment success rate by language
+    print("📊 Alignment Success by Language:")
+    print("-" * 40)
+    for lang in sorted(lang_counts.keys()):
+        count = lang_counts[lang]
+        total_lang = len(df[df["lang"] == lang]["uid"].unique())
+        success_rate = count / total_lang * 100
+        print("10")
+
+    # Scanpath statistics
+    scanpath_lengths = [len(s["scanpath"]) for s in aligned_samples]
+    print("📈 Scanpath Statistics:")
+    print("-" * 40)
+    print(f"Average fixations per sample: {np.mean(scanpath_lengths):.1f}")
+    print(f"Median fixations per sample: {np.median(scanpath_lengths):.1f}")
+    print(f"Min/Max fixations: {min(scanpath_lengths)}/{max(scanpath_lengths)}")
+
+    # Duration statistics
+    all_durations = [d for s in aligned_samples for d in s["durations"]]
+    print("⏱️  Duration Statistics:")
+    print("-" * 40)
+    print(f"Average fixation duration: {np.mean(all_durations):.1f}ms")
+    print(f"Median fixation duration: {np.median(all_durations):.1f}ms")
+    print(f"Duration range: {min(all_durations):.1f}-{max(all_durations):.1f}ms")
+
+    # Check for potential issues
+    issues = []
+    if np.mean(scanpath_lengths) < 3:
+        issues.append("⚠️  Very short scanpaths - may indicate alignment issues")
+    if np.mean(all_durations) < 100:
+        issues.append("⚠️  Very short durations - check units (should be ms)")
+    if total_samples < 1000:
+        issues.append("⚠️  Low sample count - may limit statistical power")
+
+    if issues:
+        print("🚨 POTENTIAL ISSUES:")
+        for issue in issues:
+            print(f"  {issue}")
+    else:
+        print("✅ No obvious data quality issues detected")
+    return True
+
+
+def check_data_balance(train_data, test_data):
+    """Check statistical balance between train/test splits."""
+    print("\n⚖️  TRAIN/TEST BALANCE CHECK")
+    print("="*50)
+
+    def get_stats(data):
+        stats = defaultdict(list)
+        for s in data:
+            stats["lang"].append(s["lang"])
+            stats["n_fixations"].append(s["n_fixations"])
+            stats["n_words"].append(s["n_words"])
+
+        return {
+            "count": len(data),
+            "lang_dist": dict(Counter(stats["lang"])),
+            "avg_fixations": np.mean(stats["n_fixations"]),
+            "avg_words": np.mean(stats["n_words"])
+        }
+
+    train_stats = get_stats(train_data)
+    test_stats = get_stats(test_data)
+
+    print(f"Train samples: {train_stats['count']:,}")
+    print(f"Test samples: {test_stats['count']:,}")
+    print(".1f")
+
+    # Language balance check
+    print("🌍 Language Balance:")
+    all_langs = set(train_stats["lang_dist"].keys()) | set(test_stats["lang_dist"].keys())
+    for lang in sorted(all_langs):
+        train_count = train_stats["lang_dist"].get(lang, 0)
+        test_count = test_stats["lang_dist"].get(lang, 0)
+        train_pct = train_count / train_stats["count"] * 100
+        test_pct = test_count / test_stats["count"] * 100
+        diff = abs(train_pct - test_pct)
+        status = "✅" if diff < 5 else "⚠️ "
+        print("10")
+
+    # Statistical balance
+    fix_diff = abs(train_stats["avg_fixations"] - test_stats["avg_fixations"])
+    word_diff = abs(train_stats["avg_words"] - test_stats["avg_words"])
+
+    print("📊 Statistical Balance:")
+    print(".1f")
+    print(".1f")
+
+    if fix_diff > 1 or word_diff > 1:
+        print("⚠️  Large statistical differences detected")
+    else:
+        print("✅ Statistical balance maintained")
+
+    return True
+
+# -----------------------------
+# RUN VALIDATION
+# -----------------------------
+
+validate_alignment_quality(df, train + test)
+check_data_balance(train, test)
+
+print("\n🎉 Data preparation complete with quality validation!")
+print("="*80)

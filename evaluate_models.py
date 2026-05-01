@@ -3,7 +3,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from model import EyeXpertM
+from model import EyeXpertM, LANG_FAMILY
 from train_meco import MECO, collate
 
 
@@ -14,28 +14,32 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 # =========================================================
-# MODELS
+# ABLATIONS
 # =========================================================
 MODEL_FILES = {
-    "A0_baseline": "A0_baseline_best.pt",
-    "A1_lang_cond": "A1_lang_cond_best.pt",
-    "A2_hard_moe": "A2_hard_moe_best.pt",
-    "A3_hard_moe_lang": "A3_hard_moe_lang_best.pt",
-    "A4_soft_moe": "A4_soft_moe_best.pt",
+    "base": "base.pt",
+    "base_plus": "base_plus.pt", 
+    "hard_5": "hard_5.pt",
+    "moe_5": "moe_5.pt",
+}
+
+
+MODEL_CONFIGS = {
+    "base": {"mode": "base", "n_experts": 5},        # No experts, no routing
+    "base_plus": {"mode": "base+", "n_experts": 5},  # Parameter-matched baseline
+    "hard_5": {"mode": "hard", "n_experts": 5},      # Hard routing by language family
+    "moe_5": {"mode": "moe", "n_experts": 5},        # Soft MoE routing
 }
 
 
 # =========================================================
-# FIXATION ACCURACY
+# METRICS
 # =========================================================
 def fixation_accuracy(pred, gold, mask):
     correct = (pred == gold).float()
     return (correct * mask).sum() / mask.sum()
 
 
-# =========================================================
-# NORMALIZED LEVENSHTEIN (SCANPATH SIMILARITY)
-# =========================================================
 def levenshtein(a, b):
     n, m = len(a), len(b)
     dp = [[0] * (m + 1) for _ in range(n + 1)]
@@ -61,9 +65,6 @@ def normalized_levenshtein(pred, gold):
     return levenshtein(pred, gold) / max(len(gold), 1)
 
 
-# =========================================================
-# REGRESSION RATE (COGNITIVE PROXY)
-# =========================================================
 def regression_rate(seq):
     if len(seq) < 2:
         return 0.0
@@ -71,12 +72,8 @@ def regression_rate(seq):
     return (jumps < 0).float().mean().item()
 
 
-# =========================================================
-# DURATION METRICS (LOG SPACE STANDARD IN PSYCHOLINGUISTICS)
-# =========================================================
 def duration_metrics(pred_dur, gold_dur, mask):
-
-    pred = torch.log1p(pred_dur)
+    pred = pred_dur.squeeze(-1)
     gold = torch.log1p(gold_dur)
 
     mse = ((pred - gold) ** 2 * mask).sum() / mask.sum()
@@ -89,7 +86,7 @@ def duration_metrics(pred_dur, gold_dur, mask):
 
 
 # =========================================================
-# FULL BATCH EVALUATION
+# BATCH EVAL
 # =========================================================
 def evaluate_batch(pred, gold, mask, pred_dur, gold_dur):
 
@@ -122,19 +119,20 @@ def evaluate_batch(pred, gold, mask, pred_dur, gold_dur):
         "levenshtein": lev,
         "regression_pred": reg_p,
         "regression_true": reg_g,
-        **dur
+        **dur,
+        "tokens": mask.sum().item()
     }
 
 
 # =========================================================
-# EVALUATION LOOP
+# FULL EVAL LOOP
 # =========================================================
 def evaluate(model, loader):
 
     model.eval()
 
     totals = None
-    steps = 0
+    total_tokens = 0
 
     with torch.no_grad():
         for batch in loader:
@@ -159,21 +157,22 @@ def evaluate(model, loader):
             metrics = evaluate_batch(
                 pred,
                 batch["scanpath"],
-                batch["mask"],
+                batch["scanpath_mask"],
                 dur_pred,
                 batch["durations"]
             )
 
             if totals is None:
-                totals = {k: 0.0 for k in metrics}
+                totals = {k: 0.0 for k in metrics if k != "tokens"}
 
-            for k in metrics:
-                totals[k] += metrics[k]
+            tokens = metrics["tokens"]
+            total_tokens += tokens
 
-            steps += 1
+            for k in totals:
+                totals[k] += metrics[k] * tokens
 
     for k in totals:
-        totals[k] /= steps
+        totals[k] /= total_tokens
 
     return totals
 
@@ -183,13 +182,7 @@ def evaluate(model, loader):
 # =========================================================
 def load_model(name, path):
 
-    cfg = {
-        "A0_baseline": dict(use_experts=False, routing="none", use_lang=False),
-        "A1_lang_cond": dict(use_experts=False, routing="none", use_lang=True),
-        "A2_hard_moe": dict(use_experts=True, routing="hard", use_lang=False),
-        "A3_hard_moe_lang": dict(use_experts=True, routing="hard", use_lang=True),
-        "A4_soft_moe": dict(use_experts=True, routing="soft", use_lang=False),
-    }[name]
+    cfg = MODEL_CONFIGS[name]
 
     model = EyeXpertM(**cfg)
     model.load_state_dict(torch.load(path, map_location=DEVICE))
@@ -207,8 +200,10 @@ if __name__ == "__main__":
 
     test_data = json.load(open("meco_test.json", "r", encoding="utf-8"))[:100]
 
+    dataset = MECO(test_data)
+
     loader = DataLoader(
-        MECO(test_data),
+        dataset,
         batch_size=2,
         shuffle=False,
         collate_fn=collate

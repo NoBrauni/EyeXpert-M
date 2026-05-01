@@ -15,7 +15,6 @@ LANG_FAMILY = {
     "fi": 4, "ee": 4,
 }
 
-
 # =========================================================
 # ENCODER
 # =========================================================
@@ -29,54 +28,46 @@ class Encoder(nn.Module):
 
         self.model.eval()
 
-    def forward(self, input_ids, attention_mask, word_ids_batch):
+    def forward(self, input_ids, attention_mask, word_ids):
 
         with torch.no_grad():
-            outputs = self.model(
+            out = self.model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 return_dict=True
             )
 
-        hidden = outputs.last_hidden_state
+        hidden = out.last_hidden_state
         B, S, H = hidden.shape
         device = hidden.device
 
-        word_ids = torch.as_tensor(word_ids_batch, device=device, dtype=torch.long)
+        word_ids = word_ids.to(device)
 
-        hidden_flat = hidden.reshape(B * S, H)
-        word_ids_flat = word_ids.reshape(B * S)
+        flat_h = hidden.reshape(B * S, H)
+        flat_w = word_ids.reshape(B * S)
 
-        valid_mask = word_ids_flat >= 0
-
-        hidden_flat = hidden_flat[valid_mask]
-        word_ids_flat = word_ids_flat[valid_mask]
+        valid = flat_w >= 0
+        flat_h = flat_h[valid]
+        flat_w = flat_w[valid]
 
         max_words = word_ids.max(dim=1).values
         max_words = torch.nan_to_num(max_words, nan=0).long()
 
-        offset = torch.zeros(B, device=device, dtype=torch.long)
-        offset[1:] = torch.cumsum(max_words[:-1] + 1, dim=0)
+        offsets = torch.zeros(B, device=device, dtype=torch.long)
+        offsets[1:] = torch.cumsum(max_words[:-1] + 1, dim=0)
 
-        batch_ids = torch.repeat_interleave(
-            torch.arange(B, device=device), S
-        )[valid_mask]
+        batch_ids = torch.repeat_interleave(torch.arange(B, device=device), S)[valid]
+        global_ids = flat_w + offsets[batch_ids]
 
-        global_word_ids = word_ids_flat + offset[batch_ids]
+        num_words = int(global_ids.max().item()) + 1
 
-        num_words = int(global_word_ids.max() + 1)
+        word_repr = torch.zeros(num_words, H, device=device)
+        counts = torch.zeros(num_words, 1, device=device)
 
-        word_reps = torch.zeros(num_words, H, device=device)
-        counts = torch.zeros((num_words, 1), device=device)
+        word_repr.index_add_(0, global_ids, flat_h)
+        counts.index_add_(0, global_ids, torch.ones_like(global_ids, dtype=torch.float).unsqueeze(-1))
 
-        word_reps.index_add_(0, global_word_ids, hidden_flat)
-        counts.index_add_(
-            0,
-            global_word_ids,
-            torch.ones_like(global_word_ids, dtype=torch.float).unsqueeze(-1)
-        )
-
-        word_reps = word_reps / counts.clamp(min=1.0)
+        word_repr = word_repr / counts.clamp(min=1.0)
 
         lengths = max_words + 1
         max_len = int(lengths.max())
@@ -86,257 +77,258 @@ class Encoder(nn.Module):
         start = 0
         for b in range(B):
             l = int(lengths[b])
-            out[b, :l] = word_reps[start:start + l]
+            out[b, :l] = word_repr[start:start + l]
             start += l
 
         return out
 
 
 # =========================================================
-# DECODER
+# BASE MODEL
 # =========================================================
-class Decoder(nn.Module):
-
-    def __init__(self,
-                 hidden,
-                 n_experts=5,
-                 use_experts=True,
-                 routing="none",
-                 use_lang=True,
-                 use_rnn=True):
-
+class BaseDecoder(nn.Module):
+    def __init__(self, hidden):
         super().__init__()
-
-        self.use_experts = use_experts
-        self.routing = routing
-        self.use_lang = use_lang
-        self.use_rnn = use_rnn
-
-        self.n_experts = max(1, n_experts)
-
-        self.input_proj = nn.Linear(hidden + 3, hidden)
-
-        # 🔥 REMOVE single rnn as primary path
-        # self.rnn = nn.GRUCell(hidden, hidden)
-
-        # 🔥 ALL capacity lives here
-        self.experts = nn.ModuleList([
-            nn.GRUCell(hidden, hidden) for _ in range(self.n_experts)
-        ])
-
-        self.router = nn.Sequential(
-            nn.Linear(hidden + 1, hidden // 2),
-            nn.ReLU(),
-            nn.Linear(hidden // 2, self.n_experts)
-        )
-
-        self.lang_emb = nn.Embedding(10, hidden)
-        self.family_emb = nn.Embedding(10, hidden)
-
+        self.gru = nn.GRUCell(hidden + 1, hidden)
         self.query = nn.Linear(hidden, hidden)
 
-        self.moe_metrics = {}
-
-    # -------------------------
-    # HARD ROUTING (your design stays)
-    # -------------------------
-    def hard_route(self, family):
-        return torch.clamp(family, max=self.n_experts - 1)
-
-    # -------------------------
-    # FORWARD
-    # -------------------------
-    def forward(self, memory, scanpath, durations, family, lang_id):
+    def forward(self, memory, scanpath, durations):
 
         B, W, H = memory.shape
         T = scanpath.shape[1]
 
         state = memory[:, 0]
-
-        if self.use_lang:
-            context = self.lang_emb(lang_id) + self.family_emb(family)
-        else:
-            context = torch.zeros_like(state)
-
-        zero_sacc = torch.zeros(B, 2, device=memory.device)
-        zero_dur = torch.zeros(B, 1, device=memory.device)
-
-        all_probs = []
-        last_logits = None
         states = []
 
         for t in range(T):
 
-            prev_idx = scanpath[:, t - 1] if t > 0 else torch.zeros(
-                B, dtype=torch.long, device=memory.device
-            )
+            prev = scanpath[:, t - 1] if t > 0 else torch.zeros(B, device=memory.device, dtype=torch.long)
+            prev_word = memory[torch.arange(B, device=memory.device), prev]
 
-            prev_word = memory[torch.arange(B, device=memory.device), prev_idx]
+            dur = torch.log1p(
+                durations[:, t - 1] if t > 0 else torch.zeros(B, device=memory.device)
+            ).unsqueeze(-1)
 
-            prev_dur = torch.log1p(durations[:, t - 1]).unsqueeze(-1) if t > 0 else zero_dur
+            inp = torch.cat([prev_word, dur], dim=-1)
 
-            inp = self.input_proj(torch.cat([prev_word, zero_sacc, prev_dur], dim=-1))
-
-            # -------------------------
-            # RUN ALL EXPERTS (always)
-            # -------------------------
-            expert_outputs = []
-            for expert in self.experts:
-                expert_outputs.append(expert(inp, state))
-
-            expert_outputs = torch.stack(expert_outputs, dim=1)  # (B, E, H)
-
-            # -------------------------
-            # ROUTER
-            # -------------------------
-            router_in = torch.cat([state, family.unsqueeze(-1).float()], dim=-1)
-            route_logits = self.router(router_in)
-            probs = torch.softmax(route_logits, dim=-1)
-
-            all_probs.append(probs)
-            last_logits = route_logits
-
-            # -------------------------
-            # SELECT STRATEGY
-            # -------------------------
-            if not self.use_experts:
-                # baseline: average
-                state = expert_outputs.mean(dim=1)
-
-            elif self.n_experts == 1:
-                # single expert control
-                state = expert_outputs[:, 0]
-
-            elif self.routing == "hard":
-                idx = self.hard_route(family)
-                state = expert_outputs[torch.arange(B), idx]
-
-            elif self.routing == "soft":
-                state = torch.sum(probs.unsqueeze(-1) * expert_outputs, dim=1)
-
-            else:
-                # fallback
-                state = expert_outputs.mean(dim=1)
-
-            state = state + context
+            state = self.gru(inp, state)
             states.append(state)
 
         states = torch.stack(states, dim=1)
-
-        # -------------------------
-        # FIXATION HEAD
-        # -------------------------
-        q = self.query(states)
-        logits = torch.einsum("bth,bwh->btw", q, memory)
-
-        # -------------------------
-        # METRICS
-        # -------------------------
-        if self.use_experts and self.routing == "soft" and self.n_experts > 1:
-
-            probs = torch.stack(all_probs, dim=1)
-
-            mean_probs = probs.mean(dim=(0, 1))
-
-            self.moe_metrics = {
-                "entropy": -(mean_probs * torch.log(mean_probs + 1e-8)).sum(),
-                "load_balance": (mean_probs ** 2).sum(),
-                "router_saturation": (last_logits ** 2).mean()
-            }
-        else:
-            self.moe_metrics = {
-                "entropy": torch.tensor(0.0, device=memory.device),
-                "load_balance": torch.tensor(0.0, device=memory.device),
-                "router_saturation": torch.tensor(0.0, device=memory.device)
-            }
+        logits = torch.einsum("bth,bwh->btw", self.query(states), memory)
 
         return logits, states
 
 
 # =========================================================
-# DURATION HEAD
+# BASE MODEL PLUS (parameter-matched with hard/moe)
 # =========================================================
-class DurationHead(nn.Module):
+class BaseDecoderPlus(nn.Module):
+    """Non-modular decoder with extra trainable layers to match hard/moe parameter count."""
+    def __init__(self, hidden):
+        super().__init__()
+        
+        # Stack 5 GRU cells to match hard/moe parameter count
+        self.grus = nn.ModuleList([
+            nn.GRUCell(hidden + 1, hidden) for _ in range(5)
+        ])
+        
+        # Extra linear layers for capacity
+        self.pre_processing = nn.Sequential(
+            nn.Linear(hidden + 1, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden)
+        )
+        
+        self.query = nn.Linear(hidden, hidden)
 
-    def __init__(self, hidden, use_lang=True):
+    def forward(self, memory, scanpath, durations):
+
+        B, W, H = memory.shape
+        T = scanpath.shape[1]
+
+        state = memory[:, 0]
+        states = []
+
+        for t in range(T):
+
+            prev = scanpath[:, t - 1] if t > 0 else torch.zeros(B, device=memory.device, dtype=torch.long)
+            prev_word = memory[torch.arange(B, device=memory.device), prev]
+
+            dur = torch.log1p(
+                durations[:, t - 1] if t > 0 else torch.zeros(B, device=memory.device)
+            ).unsqueeze(-1)
+
+            inp = torch.cat([prev_word, dur], dim=-1)
+            
+            # Pre-process input
+            processed = self.pre_processing(inp)
+            
+            # Pass through all GRU cells sequentially (no routing, non-modular)
+            for gru in self.grus:
+                state = gru(processed, state)
+
+            states.append(state)
+
+        states = torch.stack(states, dim=1)
+        logits = torch.einsum("bth,bwh->btw", self.query(states), memory)
+
+        return logits, states
+
+
+# =========================================================
+# HARD ROUTING (true expert selection)
+# =========================================================
+class HardDecoder(nn.Module):
+    def __init__(self, hidden, n_experts):
         super().__init__()
 
-        self.use_lang = use_lang
+        self.experts = nn.ModuleList([
+            nn.GRUCell(hidden + 1, hidden) for _ in range(n_experts)
+        ])
 
-        if use_lang:
-            self.lang_emb = nn.Embedding(10, hidden)
-            self.family_emb = nn.Embedding(10, hidden)
+        self.query = nn.Linear(hidden, hidden)
 
-        self.net = nn.Sequential(
+    def forward(self, memory, scanpath, durations, family):
+
+        B, W, H = memory.shape
+        T = scanpath.shape[1]
+
+        state = memory[:, 0]
+        states = []
+
+        for t in range(T):
+
+            prev = scanpath[:, t - 1] if t > 0 else torch.zeros(B, device=memory.device, dtype=torch.long)
+            prev_word = memory[torch.arange(B, device=memory.device), prev]
+
+            dur = torch.log1p(
+                durations[:, t - 1] if t > 0 else torch.zeros(B, device=memory.device)
+            ).unsqueeze(-1)
+
+            inp = torch.cat([prev_word, dur], dim=-1)
+
+            idx = family % len(self.experts)
+
+            new_state = torch.stack([
+                self.experts[idx[b].item()](inp[b], state[b])
+                for b in range(B)
+            ])
+
+            state = new_state
+            states.append(state)
+
+        states = torch.stack(states, dim=1)
+        logits = torch.einsum("bth,bwh->btw", self.query(states), memory)
+
+        return logits, states
+
+
+# =========================================================
+# TRUE MoE (stable + measurable)
+# =========================================================
+class MoEDecoder(nn.Module):
+    def __init__(self, hidden, n_experts):
+        super().__init__()
+
+        self.experts = nn.ModuleList([
+            nn.GRUCell(hidden + 1, hidden) for _ in range(n_experts)
+        ])
+
+        self.router = nn.Linear(hidden, n_experts)
+        self.query = nn.Linear(hidden, hidden)
+
+        self.last_probs = None
+
+    def forward(self, memory, scanpath, durations):
+
+        B, W, H = memory.shape
+        T = scanpath.shape[1]
+
+        state = memory[:, 0]
+        states = []
+
+        all_probs = []
+
+        for t in range(T):
+
+            prev = scanpath[:, t - 1] if t > 0 else torch.zeros(B, device=memory.device, dtype=torch.long)
+            prev_word = memory[torch.arange(B, device=memory.device), prev]
+
+            dur = torch.log1p(
+                durations[:, t - 1] if t > 0 else torch.zeros(B, device=memory.device)
+            ).unsqueeze(-1)
+
+            inp = torch.cat([prev_word, dur], dim=-1)
+
+            logits = self.router(state)
+            probs = torch.softmax(logits, dim=-1)
+
+            # Soft routing: weighted sum of expert outputs
+            expert_outputs = torch.stack([
+                self.experts[e](inp, state) for e in range(len(self.experts))
+            ], dim=1)  # B, n_experts, H
+
+            new_state = torch.einsum("be,bef->bf", probs, expert_outputs)
+
+            state = new_state
+            states.append(state)
+
+            all_probs.append(probs)
+
+        self.last_probs = torch.stack(all_probs, dim=1)
+
+        states = torch.stack(states, dim=1)
+        logits = torch.einsum("bth,bwh->btw", self.query(states), memory)
+
+        return logits, states
+
+
+# =========================================================
+# MODEL WRAPPER
+# =========================================================
+class EyeXpertM(nn.Module):
+
+    def __init__(self, mode="base", n_experts=5):
+        super().__init__()
+
+        self.encoder = Encoder()
+        hidden = self.encoder.model.config.hidden_size
+
+        self.mode = mode
+
+        if mode == "base":
+            self.decoder = BaseDecoder(hidden)
+        elif mode == "base+":
+            self.decoder = BaseDecoderPlus(hidden)
+        elif mode == "hard":
+            self.decoder = HardDecoder(hidden, n_experts)
+        elif mode == "moe":
+            self.decoder = MoEDecoder(hidden, n_experts)
+
+        self.duration_head = nn.Sequential(
             nn.Linear(hidden, hidden),
             nn.ReLU(),
             nn.Linear(hidden, 1)
         )
 
-    def forward(self, states, family=None, lang_id=None):
-
-        states = states.detach()
-
-        if self.use_lang:
-            context = self.lang_emb(lang_id) + self.family_emb(family)
-            states = states + context.unsqueeze(1)
-
-        return self.net(states)
-
-
-# =========================================================
-# FULL MODEL
-# =========================================================
-class EyeXpertM(nn.Module):
-
-    def __init__(self,
-                 use_experts=True,
-                 routing="none",
-                 use_lang=True,
-                 use_rnn=True,
-                 use_duration=True,
-                 n_experts=5):
-
-        super().__init__()
-
-        self.use_duration = use_duration
-
-        self.encoder = Encoder()
-        hidden = self.encoder.model.config.hidden_size
-
-        self.decoder = Decoder(
-            hidden,
-            n_experts=n_experts,
-            use_experts=use_experts,
-            routing=routing,
-            use_lang=use_lang,
-            use_rnn=use_rnn
-        )
-
-        if use_duration:
-            self.duration_head = DurationHead(hidden)
-
-    def forward(self,
-                input_ids,
-                attention_mask,
-                word_ids,
-                scanpath,
-                durations,
-                family,
-                lang_id):
+    def forward(self, input_ids, attention_mask, word_ids,
+                scanpath, durations, family, lang_id=None):
 
         memory = self.encoder(input_ids, attention_mask, word_ids)
 
-        logits, states = self.decoder(
-            memory,
-            scanpath,
-            durations,
-            family,
-            lang_id
-        )
+        if self.mode == "base" or self.mode == "base+":
+            logits, states = self.decoder(memory, scanpath, durations)
+        elif self.mode == "hard":
+            logits, states = self.decoder(memory, scanpath, durations, family)
+        else:
+            logits, states = self.decoder(memory, scanpath, durations)
 
-        dur_pred = None
-        if self.use_duration:
-            dur_pred = self.duration_head(states, family, lang_id)
+        dur_pred = self.duration_head(states)
 
-        return logits, dur_pred, self.decoder.moe_metrics
+        moe_metrics = {}
+        if self.mode == "moe" and self.decoder.last_probs is not None:
+            p = self.decoder.last_probs.mean(dim=(0, 1))
+            moe_metrics["load_balance"] = (p ** 2).sum()
+
+        return logits, dur_pred, moe_metrics
