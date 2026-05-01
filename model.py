@@ -112,39 +112,40 @@ class Decoder(nn.Module):
         self.use_lang = use_lang
         self.use_rnn = use_rnn
 
-        self.n_experts = max(1, n_experts)  # 🔥 allows 1-expert ablation
+        self.n_experts = max(1, n_experts)
 
         self.input_proj = nn.Linear(hidden + 3, hidden)
-        self.rnn = nn.GRUCell(hidden, hidden)
 
-        # router (family-aware signal is handled externally)
+        # 🔥 REMOVE single rnn as primary path
+        # self.rnn = nn.GRUCell(hidden, hidden)
+
+        # 🔥 ALL capacity lives here
+        self.experts = nn.ModuleList([
+            nn.GRUCell(hidden, hidden) for _ in range(self.n_experts)
+        ])
+
         self.router = nn.Sequential(
             nn.Linear(hidden + 1, hidden // 2),
             nn.ReLU(),
             nn.Linear(hidden // 2, self.n_experts)
         )
 
-        self.experts = nn.ModuleList([
-            nn.GRUCell(hidden, hidden) for _ in range(self.n_experts)
-        ])
-
         self.lang_emb = nn.Embedding(10, hidden)
         self.family_emb = nn.Embedding(10, hidden)
 
         self.query = nn.Linear(hidden, hidden)
 
-        # diagnostics (returned, NOT logged here)
         self.moe_metrics = {}
 
-    # =====================================================
-    # HARD ROUTING (STRICT EXPERIMENT CONTROLLED)
-    # =====================================================
+    # -------------------------
+    # HARD ROUTING (your design stays)
+    # -------------------------
     def hard_route(self, family):
-        return family % self.n_experts
+        return torch.clamp(family, max=self.n_experts - 1)
 
-    # =====================================================
+    # -------------------------
     # FORWARD
-    # =====================================================
+    # -------------------------
     def forward(self, memory, scanpath, durations, family, lang_id):
 
         B, W, H = memory.shape
@@ -152,14 +153,16 @@ class Decoder(nn.Module):
 
         state = memory[:, 0]
 
-        context = self.lang_emb(lang_id) + self.family_emb(family)
+        if self.use_lang:
+            context = self.lang_emb(lang_id) + self.family_emb(family)
+        else:
+            context = torch.zeros_like(state)
 
         zero_sacc = torch.zeros(B, 2, device=memory.device)
         zero_dur = torch.zeros(B, 1, device=memory.device)
 
         all_probs = []
         last_logits = None
-
         states = []
 
         for t in range(T):
@@ -174,38 +177,46 @@ class Decoder(nn.Module):
 
             inp = self.input_proj(torch.cat([prev_word, zero_sacc, prev_dur], dim=-1))
 
-            state = self.rnn(inp, state) if self.use_rnn else inp
+            # -------------------------
+            # RUN ALL EXPERTS (always)
+            # -------------------------
+            expert_outputs = []
+            for expert in self.experts:
+                expert_outputs.append(expert(inp, state))
+
+            expert_outputs = torch.stack(expert_outputs, dim=1)  # (B, E, H)
 
             # -------------------------
-            # ROUTER INPUT
+            # ROUTER
             # -------------------------
             router_in = torch.cat([state, family.unsqueeze(-1).float()], dim=-1)
             route_logits = self.router(router_in)
-
             probs = torch.softmax(route_logits, dim=-1)
 
             all_probs.append(probs)
             last_logits = route_logits
 
             # -------------------------
-            # EXPERTS
+            # SELECT STRATEGY
             # -------------------------
-            if self.use_experts and self.n_experts > 1:
+            if not self.use_experts:
+                # baseline: average
+                state = expert_outputs.mean(dim=1)
 
-                if self.routing == "soft":
-                    new_state = 0
-                    for i, expert in enumerate(self.experts):
-                        new_state += probs[:, i].unsqueeze(-1) * expert(state, state)
-                    state = new_state
+            elif self.n_experts == 1:
+                # single expert control
+                state = expert_outputs[:, 0]
 
-                elif self.routing == "hard":
-                    idx = self.hard_route(family)
+            elif self.routing == "hard":
+                idx = self.hard_route(family)
+                state = expert_outputs[torch.arange(B), idx]
 
-                    new_state = torch.zeros_like(state)
-                    for i, expert in enumerate(self.experts):
-                        mask = (idx == i).float().unsqueeze(-1)
-                        new_state += mask * expert(state, state)
-                    state = new_state
+            elif self.routing == "soft":
+                state = torch.sum(probs.unsqueeze(-1) * expert_outputs, dim=1)
+
+            else:
+                # fallback
+                state = expert_outputs.mean(dim=1)
 
             state = state + context
             states.append(state)
@@ -219,11 +230,11 @@ class Decoder(nn.Module):
         logits = torch.einsum("bth,bwh->btw", q, memory)
 
         # -------------------------
-        # DIAGNOSTICS (computed but not logged here)
+        # METRICS
         # -------------------------
         if self.use_experts and self.routing == "soft" and self.n_experts > 1:
 
-            probs = torch.stack(all_probs, dim=1)  # (B,T,E)
+            probs = torch.stack(all_probs, dim=1)
 
             mean_probs = probs.mean(dim=(0, 1))
 
