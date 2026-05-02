@@ -354,11 +354,9 @@ def evaluate(model, loader):
 # =========================================================
 ABLATIONS = {
     "base": ("base", 5),
-    "base_plus": ("base+", 5),
-    "hard_5": ("hard", 5),
-    "moe_5": ("moe", 5),
-    "hard_3": ("hard", 3),
-    "moe_3": ("moe", 3),
+    "base_plus": ("base+", 5),      # Parameter-matched non-modular baseline
+    "hard_5": ("hard", 5),          # Hard routing: 1 expert per language family
+    "moe_5": ("moe", 5),            # MoE routing: learned expert selection
 }
 
 LANG_FAMILY_NAMES = {

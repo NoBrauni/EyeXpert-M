@@ -135,9 +135,9 @@ class BaseDecoderPlus(nn.Module):
         
         # Extra linear layers for capacity
         self.pre_processing = nn.Sequential(
-            nn.Linear(hidden + 1, hidden),
+            nn.Linear(hidden + 1, hidden + 1),
             nn.ReLU(),
-            nn.Linear(hidden, hidden)
+            nn.Linear(hidden + 1, hidden + 1)
         )
         
         self.query = nn.Linear(hidden, hidden)

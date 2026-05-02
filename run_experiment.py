@@ -6,11 +6,20 @@ Usage:
   python run_experiment.py
 
 This will:
-1. Run all ablations (base, base_plus, hard_5, moe_5, hard_3, moe_3)
+1. Run all ablations (base, base_plus, hard_5, moe_5)
 2. Evaluate all models on test set
-3. Save comprehensive results to results.csv
+3. Save comprehensive results to experiment_results.csv
 
 The CSV can be easily shared and analyzed.
+
+SCIENTIFIC DESIGN:
+- base: Minimal non-modular baseline (4.7M params)
+- base_plus: Parameter-matched non-modular (18.9M params)
+- hard_5: Language-family hard routing (18.9M params, 5 experts = 1 per family)
+- moe_5: Learned soft routing (18.9M params, 5 experts = 1 per family)
+
+Note: 5 experts ensures 1 expert per language family. Using <5 experts would create
+collisions (e.g., family 3→expert 0, family 4→expert 1), undermining the modularity hypothesis.
 """
 
 import json
@@ -31,7 +40,7 @@ from train_meco import MECO, collate
 # =========================================================
 # CONFIGURATION
 # =========================================================
-FAST_MODE = False  # Set to True for quick testing (1 epoch, 0.5% data)
+FAST_MODE = True  # Set to True for quick testing (1 epoch, 0.5% data)
 EPOCHS = 1 if FAST_MODE else 3
 SUBSAMPLE_FRACTION = 0.005 if FAST_MODE else 0.01
 SKIP_INFERENCE_TIME = FAST_MODE
@@ -50,13 +59,14 @@ USE_AMP = DEVICE.type == "cuda"
 scaler = torch.amp.GradScaler("cuda", enabled=USE_AMP)
 
 # Experiments to run
+# NOTE: Using 5 experts ensures one expert per language family
+# Hard routing with <5 experts creates collisions (e.g., family 3→expert 0, family 4→expert 1)
+# This would undermine the core hypothesis of language-family-based modularity
 ABLATIONS = {
     "base": ("base", 5),
-    "base_plus": ("base+", 5),
-    "hard_5": ("hard", 5),
-    "moe_5": ("moe", 5),
-    "hard_3": ("hard", 3),
-    "moe_3": ("moe", 3),
+    "base_plus": ("base+", 5),      # Parameter-matched non-modular baseline
+    "hard_5": ("hard", 5),          # Hard routing: 1 expert per language family
+    "moe_5": ("moe", 5),            # MoE routing: learned expert selection
 }
 
 
@@ -169,15 +179,17 @@ def forward(model, batch):
     )
 
     if len(out) == 3:
-        logits, dur, moe = out
+        logits, dur, moe_metrics = out
+        # Extract scalar loss from moe_metrics dict
+        moe_loss = moe_metrics.get("load_balance", 0.0) if isinstance(moe_metrics, dict) else 0.0
     else:
         logits, dur = out
-        moe = 0.0
+        moe_loss = 0.0
 
-    return logits, dur, moe
+    return logits, dur, moe_loss
 
 
-def train(model, train_loader, val_loader, name, epochs=None):
+def train(model, train_loader, val_data, name, epochs=None):
     if epochs is None:
         epochs = EPOCHS
 
@@ -187,6 +199,16 @@ def train(model, train_loader, val_loader, name, epochs=None):
     best = float("inf")
     patience_counter = 0
     results = {"best_val_loss": float("inf"), "best_epoch": -1}
+
+    # Create validation loader
+    val_loader = DataLoader(
+        MECO(val_data),
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        collate_fn=collate,
+        num_workers=0,  # Use 0 for validation to avoid issues
+        pin_memory=False if DEVICE.type == "cpu" else True
+    )
 
     for ep in range(epochs):
         model.train()
@@ -381,11 +403,14 @@ def track_expert_usage(model, loader):
                 batch["lang_id"]
             )
             if model.decoder.last_probs is not None:
-                all_probs.append(model.decoder.last_probs.cpu())
+                # Flatten batch and sequence dimensions: [B, T, n_experts] -> [B*T, n_experts]
+                batch_probs = model.decoder.last_probs.view(-1, model.decoder.last_probs.size(-1))
+                all_probs.append(batch_probs)
 
     if not all_probs:
         return None
 
+    # Concatenate all flattened probabilities: [total_samples, n_experts]
     all_probs = torch.cat(all_probs, dim=0)
     mean_probs = all_probs.mean(dim=0)
 
