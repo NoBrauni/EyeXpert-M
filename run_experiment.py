@@ -322,7 +322,31 @@ def evaluate_detailed(model, loader):
 
 def evaluate_batch_detailed(pred, gold, mask, pred_dur, gold_dur):
     B = pred.size(0)
-    acc = ((pred == gold).float() * mask).sum() / mask.sum()
+
+    acc = fixation_accuracy(pred, gold, mask)
+
+    lev_total = 0
+    reg_p = 0
+    reg_g = 0
+    exact_match = 0
+
+    for i in range(B):
+        L = int(mask[i].sum().item())
+
+        p = pred[i][:L].tolist()
+        g = gold[i][:L].tolist()
+
+        lev_total += normalized_levenshtein(p, g)
+        reg_p += regression_rate(p)
+        reg_g += regression_rate(g)
+        
+        if p == g:
+            exact_match += 1
+
+    lev = lev_total / B
+    reg_p /= B
+    reg_g /= B
+    exact_match_rate = exact_match / B
 
     # Duration metrics
     pred_d = pred_dur.squeeze(-1)
@@ -332,6 +356,10 @@ def evaluate_batch_detailed(pred, gold, mask, pred_dur, gold_dur):
 
     return {
         "accuracy": acc.item(),
+        "levenshtein": lev,
+        "regression_pred": reg_p,
+        "regression_true": reg_g,
+        "exact_match": exact_match_rate,
         "dur_mse": dur_mse.item(),
         "dur_mae": dur_mae.item(),
         "tokens": mask.sum().item()
@@ -422,6 +450,46 @@ def track_expert_usage(model, loader):
 
 
 # =========================================================
+# METRICS
+# =========================================================
+def fixation_accuracy(pred, gold, mask):
+    correct = (pred == gold).float()
+    return (correct * mask).sum() / mask.sum()
+
+
+def levenshtein(a, b):
+    n, m = len(a), len(b)
+    dp = [[0] * (m + 1) for _ in range(n + 1)]
+
+    for i in range(n + 1):
+        dp[i][0] = i
+    for j in range(m + 1):
+        dp[0][j] = j
+
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            dp[i][j] = min(
+                dp[i - 1][j] + 1,
+                dp[i][j - 1] + 1,
+                dp[i - 1][j - 1] + cost
+            )
+
+    return dp[n][m]
+
+
+def normalized_levenshtein(pred, gold):
+    return levenshtein(pred, gold) / max(len(gold), 1)
+
+
+def regression_rate(seq):
+    if len(seq) < 2:
+        return 0.0
+    jumps = torch.diff(torch.tensor(seq))
+    return (jumps < 0).float().mean().item()
+
+
+# =========================================================
 # MAIN EXPERIMENT
 # =========================================================
 def main():
@@ -504,6 +572,10 @@ def main():
             "best_epoch": train_results["best_epoch"],
             "test_loss": test_loss,
             "accuracy": detailed_metrics["accuracy"],
+            "levenshtein": detailed_metrics["levenshtein"],
+            "regression_pred": detailed_metrics["regression_pred"],
+            "regression_true": detailed_metrics["regression_true"],
+            "exact_match": detailed_metrics["exact_match"],
             "dur_mse": detailed_metrics["dur_mse"],
             "dur_mae": detailed_metrics["dur_mae"],
             "inference_time_ms": inference_time * 1000,
@@ -529,6 +601,7 @@ def main():
     fieldnames = [
         "model", "mode", "n_experts", "total_params", "trainable_params",
         "best_val_loss", "best_epoch", "test_loss", "accuracy",
+        "levenshtein", "regression_pred", "regression_true", "exact_match",
         "dur_mse", "dur_mae", "inference_time_ms",
         "germanic_loss", "romance_loss", "north_germanic_loss", "slavic_loss", "finno_ugric_loss",
         "load_balance", "router_entropy"
