@@ -198,7 +198,7 @@ if __name__ == "__main__":
 
     print("Loading test set...")
 
-    test_data = json.load(open("meco_test.json", "r", encoding="utf-8"))[:100]
+    test_data = json.load(open("meco_test.json", "r", encoding="utf-8"))
 
     dataset = MECO(test_data)
 

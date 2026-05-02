@@ -42,7 +42,7 @@ from train_meco import MECO, collate
 # =========================================================
 FAST_MODE = True  # Set to True for quick testing (1 epoch, 0.5% data)
 EPOCHS = 1 if FAST_MODE else 3
-SUBSAMPLE_FRACTION = 0.005 if FAST_MODE else 0.01
+SUBSAMPLE_FRACTION = 0.005 if FAST_MODE else 0.2
 SKIP_INFERENCE_TIME = FAST_MODE
 EARLY_STOPPING_PATIENCE = 2 if not FAST_MODE else 1
 
@@ -415,7 +415,7 @@ def track_expert_usage(model, loader):
     mean_probs = all_probs.mean(dim=0)
 
     return {
-        "mean_probs": mean_probs.numpy(),
+        "mean_probs": mean_probs.cpu().numpy(),
         "load_balance": (mean_probs ** 2).sum().item(),
         "entropy": -(mean_probs * torch.log(mean_probs + 1e-8)).sum().item(),
     }
@@ -442,9 +442,12 @@ def main():
 
     # Load and prepare data
     print("\n📊 Loading data...")
-    data = json.load(open("meco_train.json"))
-    data = stratified_subsample(data, fraction=SUBSAMPLE_FRACTION)
-    train_data, val_data, test_data = split_data(data)
+    train_val_data = json.load(open("meco_train.json"))
+    train_val_data = stratified_subsample(train_val_data, fraction=SUBSAMPLE_FRACTION)
+    train_data, val_data, _ = split_data(train_val_data)  # Split into train/val, ignore test split from train data
+    
+    test_data = json.load(open("meco_test.json"))
+    test_data = stratified_subsample(test_data, fraction=SUBSAMPLE_FRACTION)  # Subsample test for consistency in FAST_MODE
 
     train_loader = DataLoader(
         MECO(train_data),
@@ -553,25 +556,25 @@ def main():
     moe_5_result = next(r for r in all_results if r["mode"] == "moe" and r["n_experts"] == 5)
 
     print("Test Losses:")
-    print(".4f")
-    print(".4f")
-    print(".4f")
-    print(".4f")
+    print(f"  Base: {base_result['test_loss']:.4f}")
+    print(f"  Base+: {base_plus_result['test_loss']:.4f}")
+    print(f"  Hard-5: {hard_5_result['test_loss']:.4f}")
+    print(f"  MoE-5: {moe_5_result['test_loss']:.4f}")
 
     print("Modularity Effect (vs parameter-matched baseline):")
     hard_improvement = (1 - hard_5_result["test_loss"] / base_plus_result["test_loss"]) * 100
     moe_improvement = (1 - moe_5_result["test_loss"] / base_plus_result["test_loss"]) * 100
-    print(".2f")
-    print(".2f")
+    print(f"  Hard routing: {hard_improvement:.2f}%")
+    print(f"  MoE routing: {moe_improvement:.2f}%")
 
     print("Routing Strategy Comparison:")
     routing_diff = (moe_5_result["test_loss"] - hard_5_result["test_loss"]) / hard_5_result["test_loss"] * 100
-    print(".2f")
+    print(f"  MoE vs Hard: {routing_diff:.2f}%")
 
     best_model = min([base_result, hard_5_result, moe_5_result], key=lambda x: x["test_loss"])
-    print(f"\n🏆 Best Model: {best_model['model']} (Test Loss: {best_model['test_loss']:.4f})")
+    print(f"\n Best Model: {best_model['model']} (Test Loss: {best_model['test_loss']:.4f})")
 
-    print("\n✅ Experiment complete! Share experiment_results.csv for analysis.")
+    print("\n Experiment complete! Share experiment_results.csv for analysis.")
     print("="*80)
 
 
