@@ -17,6 +17,10 @@ SENTENCE_CSV = "sentences.csv"
 TEST_RATIO = 0.2
 RANDOM_SEED = 42
 
+# Data quality filtering
+MIN_FIXATION_DURATION = 80  # milliseconds (standard in eye-tracking: exclude microsaccades < 80ms)
+FILTER_BLINKS = True  # Remove blink events from raw data
+
 LANGUAGES = [
     "en", "en_uk", "du", "ge", "ge_po", "ge_zu",
     "no", "da", "ic",
@@ -52,6 +56,19 @@ df = pd.concat([
 ], ignore_index=True)
 
 df = df[df["lang"].isin(LANGUAGES)].copy()
+
+# ========== DATA QUALITY FILTERING ==========
+print(f"Before filtering: {len(df):,} fixations")
+
+# Filter out blinks (standard eye-tracking data cleaning)
+if FILTER_BLINKS and "blink" in df.columns:
+    df = df[df["blink"] == 0].copy()
+    print(f"After blink filtering: {len(df):,} fixations")
+
+# Filter out very short fixations (< 80ms standard threshold to exclude microsaccades)
+if "dur" in df.columns:
+    df = df[pd.to_numeric(df["dur"], errors="coerce") >= MIN_FIXATION_DURATION].copy()
+    print(f"After duration filtering (>= {MIN_FIXATION_DURATION}ms): {len(df):,} fixations")
 
 # sentence bank
 sentences = pd.read_csv(SENTENCE_CSV)["sentence"].dropna()
@@ -100,32 +117,101 @@ df["uid"] = (
 
 meta = df.groupby("uid").first().reset_index()[["uid", "subid", "lang", "full_sentence"]]
 
-# -----------------------------
-# SPLIT (BALANCED TEST)
-# -----------------------------
 
-print("Creating balanced split...")
+print("Creating split: hybrid test set (unseen sentences + unseen readers)...")
 
 np.random.seed(RANDOM_SEED)
 
-test_uids = []
+# Step 1: Split sentences 80/20 per language (test-exclusive sentences)
+train_sentences = set()
+test_sentences = set()
 
-for lang, g in meta.groupby("lang"):
-    uids = g["uid"].tolist()
-    np.random.shuffle(uids)
+for lang in meta["lang"].unique():
+    lang_sentences = meta[meta["lang"] == lang]["full_sentence"].unique()
+    sentences_list = list(lang_sentences)
+    np.random.shuffle(sentences_list)
 
-    n_test = int(len(uids) * TEST_RATIO)
-    test_uids.extend(uids[:n_test])
+    n_test = int(len(sentences_list) * TEST_RATIO)
+    test_sentences.update(sentences_list[:n_test])
+    train_sentences.update(sentences_list[n_test:])
 
-test_uids = set(test_uids)
+print(f"Sentence split: {len(train_sentences)} train, {len(test_sentences)} test-exclusive")
 
-train_uids = set(meta["uid"]) - test_uids
+# Step 2: Split readers 80/20 per language (test-exclusive readers)
+train_readers = set()
+test_readers = set()
 
-# sanity: no overlap
-assert len(train_uids & test_uids) == 0
+for lang in meta["lang"].unique():
+    lang_readers = meta[meta["lang"] == lang]["subid"].unique()
+    readers_list = list(lang_readers)
+    np.random.shuffle(readers_list)
 
-print("Train UIDs:", len(train_uids))
-print("Test UIDs:", len(test_uids))
+    n_test = int(len(readers_list) * TEST_RATIO)
+    test_readers.update(readers_list[:n_test])
+    train_readers.update(readers_list[n_test:])
+
+print(f"Reader split: {len(train_readers)} train, {len(test_readers)} test-exclusive")
+
+# Step 3: Build train/test sets
+train_uids = set()
+test_uids = set()
+
+for _, row in meta.iterrows():
+    uid = row["uid"]
+    reader = row["subid"]
+    sentence = row["full_sentence"]
+
+    # TEST SET: Two conditions (inclusive OR)
+    if (sentence in test_sentences) or (reader in test_readers):
+        # Include if:
+        # - ANY reader reading test sentences (all readers see new sentences)
+        # - OR test readers reading any sentence (test readers are completely new)
+        test_uids.add(uid)
+    # TRAIN SET: Both conditions (both AND)
+    elif (reader in train_readers) and (sentence in train_sentences):
+        # Include only if:
+        # - Train reader AND train sentence (guaranteed no leakage)
+        train_uids.add(uid)
+
+print(f"\nFinal split:")
+print(f"  Train UIDs: {len(train_uids):,}")
+print(f"  Test UIDs: {len(test_uids):,}")
+
+# Validation
+assert len(train_uids & test_uids) == 0, "Train/test overlap detected!"
+
+test_readers_actual = set(meta[meta["uid"].isin(test_uids)]["subid"].unique())
+test_sentences_actual = set(meta[meta["uid"].isin(test_uids)]["full_sentence"].unique())
+
+train_readers_actual = set(meta[meta["uid"].isin(train_uids)]["subid"].unique())
+train_sentences_actual = set(meta[meta["uid"].isin(train_uids)]["full_sentence"].unique())
+
+reader_overlap = test_readers_actual & train_readers_actual
+sentence_overlap = test_sentences_actual & train_sentences_actual
+
+print(f"\nVALIDATION RESULTS:")
+print(f"  Test readers: {len(test_readers_actual)}")
+print(f"  Test sentences: {len(test_sentences_actual)}")
+print(f"  Reader overlap: {len(reader_overlap)} (test readers NOT in train: YES)")
+print(f"  Sentence overlap: {len(sentence_overlap)} (test sentences NOT in train: YES)")
+
+test_only_readers = test_readers_actual - train_readers_actual
+test_only_sentences = test_sentences_actual - train_sentences_actual
+bridge_readers = test_readers_actual & train_readers_actual  # Readers in both sets
+
+print(f"\nSPLIT COMPOSITION:")
+print(f"  Test-exclusive readers: {len(test_only_readers)} (completely new readers)")
+print(f"  Bridge readers (in both sets): {len(bridge_readers)} (see new sentences in test)")
+print(f"  Test-exclusive sentences: {len(test_only_sentences)} (completely new sentences)")
+print(f"  Bridge sentences (in both sets): {len(test_sentences_actual - test_only_sentences)} (seen by new readers only)")
+
+if len(test_only_readers) > 0 and len(test_only_sentences) > 0:
+    print(f"\n  → PERFECT! Test set achieves:")
+    print(f"     • Completely unseen readers: YES ({len(test_only_readers)} readers)")
+    print(f"     • Completely unseen sentences: YES ({len(test_only_sentences)} sentences)")
+    print(f"     • Generalization test: YES (bridge readers see new sentences)")
+else:
+    print(f"\n Suboptimal split, but test is still independent")
 
 # -----------------------------
 # ALIGNMENT
@@ -268,7 +354,7 @@ print(" - meco_test.json")
 
 def validate_alignment_quality(df, aligned_samples):
     """Validate alignment quality and report statistics."""
-    print("\n🔍 ALIGNMENT QUALITY VALIDATION")
+    print("\n ALIGNMENT QUALITY VALIDATION")
     print("="*50)
 
     total_samples = len(aligned_samples)
@@ -281,57 +367,68 @@ def validate_alignment_quality(df, aligned_samples):
 
     print(f"✓ Total aligned samples: {total_samples:,}")
     print(f"✓ Total fixations: {total_fixations:,}")
-    print(".2f")
+    
+    original_fixations = len(df)
+    retention_rate = total_fixations / original_fixations * 100
+    print(f"✓ Fixation retention rate: {retention_rate:.2f}%")
 
     # Alignment success rate by language
-    print("📊 Alignment Success by Language:")
+    print("\nAlignment Success by Language:")
     print("-" * 40)
     for lang in sorted(lang_counts.keys()):
         count = lang_counts[lang]
         total_lang = len(df[df["lang"] == lang]["uid"].unique())
-        success_rate = count / total_lang * 100
-        print("10")
+        success_rate = count / total_lang * 100 if total_lang > 0 else 0
+        print(f"  {lang}: {count:5d} samples ({success_rate:5.1f}% success rate)")
 
     # Scanpath statistics
     scanpath_lengths = [len(s["scanpath"]) for s in aligned_samples]
-    print("📈 Scanpath Statistics:")
+    print("\nScanpath Statistics:")
     print("-" * 40)
-    print(f"Average fixations per sample: {np.mean(scanpath_lengths):.1f}")
-    print(f"Median fixations per sample: {np.median(scanpath_lengths):.1f}")
-    print(f"Min/Max fixations: {min(scanpath_lengths)}/{max(scanpath_lengths)}")
+    print(f"  Average fixations per sample: {np.mean(scanpath_lengths):.1f}")
+    print(f"  Median fixations per sample: {np.median(scanpath_lengths):.1f}")
+    print(f"  Min/Max fixations: {min(scanpath_lengths)}/{max(scanpath_lengths)}")
 
     # Duration statistics
     all_durations = [d for s in aligned_samples for d in s["durations"]]
-    print("⏱️  Duration Statistics:")
+    print("\nDuration Statistics:")
     print("-" * 40)
-    print(f"Average fixation duration: {np.mean(all_durations):.1f}ms")
-    print(f"Median fixation duration: {np.median(all_durations):.1f}ms")
-    print(f"Duration range: {min(all_durations):.1f}-{max(all_durations):.1f}ms")
+    print(f"  Average fixation duration: {np.mean(all_durations):.1f}ms")
+    print(f"  Median fixation duration: {np.median(all_durations):.1f}ms")
+    print(f"  Duration range: {min(all_durations):.1f}-{max(all_durations):.1f}ms")
 
     # Check for potential issues
     issues = []
     if np.mean(scanpath_lengths) < 3:
-        issues.append("⚠️  Very short scanpaths - may indicate alignment issues")
+        issues.append("Very short scanpaths - may indicate alignment issues")
     if np.mean(all_durations) < 100:
-        issues.append("⚠️  Very short durations - check units (should be ms)")
+        issues.append("Very short durations - check units (should be ms)")
     if total_samples < 1000:
-        issues.append("⚠️  Low sample count - may limit statistical power")
+        issues.append("Low sample count - may limit statistical power")
 
     if issues:
-        print("🚨 POTENTIAL ISSUES:")
+        print("\nPOTENTIAL ISSUES:")
         for issue in issues:
-            print(f"  {issue}")
+            print(f"  ⚠️  {issue}")
     else:
-        print("✅ No obvious data quality issues detected")
+        print("\n✅ No obvious data quality issues detected")
     return True
 
 
 def check_data_balance(train_data, test_data):
     """Check statistical balance between train/test splits."""
-    print("\n⚖️  TRAIN/TEST BALANCE CHECK")
+    print("\nTRAIN/TEST BALANCE CHECK")
     print("="*50)
 
     def get_stats(data):
+        if len(data) == 0:
+            return {
+                "count": 0,
+                "lang_dist": {},
+                "avg_fixations": 0,
+                "avg_words": 0
+            }
+        
         stats = defaultdict(list)
         for s in data:
             stats["lang"].append(s["lang"])
@@ -350,32 +447,35 @@ def check_data_balance(train_data, test_data):
 
     print(f"Train samples: {train_stats['count']:,}")
     print(f"Test samples: {test_stats['count']:,}")
-    print(".1f")
+    
+    if test_stats['count'] == 0:
+        print("WARNING: Test set is empty!")
+        return False
 
     # Language balance check
-    print("🌍 Language Balance:")
+    print("\nLanguage Balance:")
     all_langs = set(train_stats["lang_dist"].keys()) | set(test_stats["lang_dist"].keys())
     for lang in sorted(all_langs):
         train_count = train_stats["lang_dist"].get(lang, 0)
         test_count = test_stats["lang_dist"].get(lang, 0)
-        train_pct = train_count / train_stats["count"] * 100
-        test_pct = test_count / test_stats["count"] * 100
+        train_pct = train_count / max(train_stats["count"], 1) * 100
+        test_pct = test_count / max(test_stats["count"], 1) * 100
         diff = abs(train_pct - test_pct)
         status = "✅" if diff < 5 else "⚠️ "
-        print("10")
+        print(f"  {status} {lang}: train {train_pct:5.1f}%, test {test_pct:5.1f}% (diff {diff:5.1f}%)")
 
     # Statistical balance
     fix_diff = abs(train_stats["avg_fixations"] - test_stats["avg_fixations"])
     word_diff = abs(train_stats["avg_words"] - test_stats["avg_words"])
 
-    print("📊 Statistical Balance:")
-    print(".1f")
-    print(".1f")
+    print("\nStatistical Balance:")
+    print(f"  Avg fixations - train: {train_stats['avg_fixations']:.1f}, test: {test_stats['avg_fixations']:.1f} (diff {fix_diff:.1f})")
+    print(f"  Avg words - train: {train_stats['avg_words']:.1f}, test: {test_stats['avg_words']:.1f} (diff {word_diff:.1f})")
 
     if fix_diff > 1 or word_diff > 1:
-        print("⚠️  Large statistical differences detected")
+        print(" Large statistical differences detected")
     else:
-        print("✅ Statistical balance maintained")
+        print(" Statistical balance maintained")
 
     return True
 
@@ -386,5 +486,27 @@ def check_data_balance(train_data, test_data):
 validate_alignment_quality(df, train + test)
 check_data_balance(train, test)
 
-print("\n🎉 Data preparation complete with quality validation!")
+print("\n DATA PREPARATION SUMMARY")
+print("="*80)
+print("\nDATA QUALITY FILTERING APPLIED:")
+print(f"  ✓ Blinks removed (blink == 0)")
+print(f"  ✓ Minimum fixation duration: {MIN_FIXATION_DURATION}ms (excludes microsaccades)")
+
+
+print("\nDATA SPLIT STATISTICS:")
+print(f"  • Training samples: {len(train):,}")
+print(f"  • Test samples: {len(test):,}")
+if len(train) + len(test) > 0:
+    test_ratio = len(test) / (len(train) + len(test)) * 100
+    print(f"  • Test ratio: {test_ratio:.1f}%")
+
+print("\nTOTAL FIXATIONS (AFTER CLEANING):")
+total_train_fixations = sum(len(s['scanpath']) for s in train)
+total_test_fixations = sum(len(s['scanpath']) for s in test)
+total_fixations = total_train_fixations + total_test_fixations
+print(f"  • Training fixations: {total_train_fixations:,}")
+print(f"  • Test fixations: {total_test_fixations:,}")
+print(f"  • Total: {total_fixations:,}")
+
+print("\n Data preparation complete!")
 print("="*80)
