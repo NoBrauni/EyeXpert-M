@@ -18,8 +18,6 @@ SCIENTIFIC DESIGN:
 - hard_5: Language-family hard routing (18.9M params, 5 experts = 1 per family)
 - moe_5: Learned soft routing (18.9M params, 5 experts = 1 per family)
 
-Note: 5 experts ensures 1 expert per language family. Using <5 experts would create
-collisions (e.g., family 3→expert 0, family 4→expert 1), undermining the modularity hypothesis.
 """
 
 import json
@@ -40,15 +38,15 @@ from train_meco import MECO, collate
 # =========================================================
 # CONFIGURATION
 # =========================================================
-FAST_MODE = True  # Set to True for quick testing (1 epoch, 0.5% data)
-EPOCHS = 1 if FAST_MODE else 3
-SUBSAMPLE_FRACTION = 0.005 if FAST_MODE else 0.2
+FAST_MODE = False
+EPOCHS = 1 if FAST_MODE else 5
+SUBSAMPLE_FRACTION = 0.005 if FAST_MODE else 1.0
 SKIP_INFERENCE_TIME = FAST_MODE
 EARLY_STOPPING_PATIENCE = 2 if not FAST_MODE else 1
 
 # Hyperparameters
 LR = 1e-4
-BATCH_SIZE = 4  # Optimized for T4
+BATCH_SIZE = 4
 ACCUM_STEPS = 2
 LAMBDA_DUR = 0.01
 MOE_LAMBDA = 0.01
@@ -58,10 +56,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 USE_AMP = DEVICE.type == "cuda"
 scaler = torch.amp.GradScaler("cuda", enabled=USE_AMP)
 
-# Experiments to run
-# NOTE: Using 5 experts ensures one expert per language family
-# Hard routing with <5 experts creates collisions (e.g., family 3→expert 0, family 4→expert 1)
-# This would undermine the core hypothesis of language-family-based modularity
+
 ABLATIONS = {
     "base": ("base", 5),
     "base_plus": ("base+", 5),      # Parameter-matched non-modular baseline
@@ -501,7 +496,7 @@ def main():
         print("⚡ FAST MODE: Quick testing")
         print(f"   Epochs: {EPOCHS}, Data: {SUBSAMPLE_FRACTION*100:.1f}%")
     else:
-        print("🚀 FULL MODE: Complete experiment")
+        print("FULL MODE: Complete experiment")
         print(f"   Epochs: {EPOCHS}, Data: {SUBSAMPLE_FRACTION*100:.1f}%")
 
     print(f"   Device: {DEVICE}")
@@ -509,7 +504,7 @@ def main():
     print("="*80)
 
     # Load and prepare data
-    print("\n📊 Loading data...")
+    print("\n Loading data...")
     train_val_data = json.load(open("meco_train.json"))
     train_val_data = stratified_subsample(train_val_data, fraction=SUBSAMPLE_FRACTION)
     train_data, val_data, _ = split_data(train_val_data)  # Split into train/val, ignore test split from train data
@@ -529,11 +524,11 @@ def main():
     print(f"   Train: {len(train_data)}, Val: {len(val_data)}, Test: {len(test_data)}")
 
     # Run ablations
-    print("\n🏃 Running ablations...")
+    print("\n Running ablations...")
     all_results = []
 
     for name, (mode, n_experts) in ABLATIONS.items():
-        print(f"\n🔬 Training {name} (mode={mode}, experts={n_experts})")
+        print(f"\n Training {name} (mode={mode}, experts={n_experts})")
 
         model = EyeXpertM(mode=mode, n_experts=n_experts)
         total_params, trainable_params = count_parameters(model)
@@ -596,7 +591,7 @@ def main():
         all_results.append(result)
 
     # Save results to CSV
-    print("\n💾 Saving results to CSV...")
+    print("\n Saving results to CSV...")
 
     fieldnames = [
         "model", "mode", "n_experts", "total_params", "trainable_params",
@@ -620,7 +615,7 @@ def main():
     print("   ✓ Results saved to experiment_results.csv")
 
     # Print summary
-    print("\n📈 EXPERIMENT SUMMARY")
+    print("\n EXPERIMENT SUMMARY")
     print("="*80)
 
     base_result = next(r for r in all_results if r["mode"] == "base")
