@@ -18,7 +18,7 @@ TEST_RATIO = 0.2
 RANDOM_SEED = 42
 
 # Data quality filtering
-MIN_FIXATION_DURATION = 80  # milliseconds (standard in eye-tracking: exclude microsaccades < 80ms)
+MIN_FIXATION_DURATION = 80  # milliseconds
 FILTER_BLINKS = True  # Remove blink events from raw data
 
 LANGUAGES = [
@@ -65,7 +65,7 @@ if FILTER_BLINKS and "blink" in df.columns:
     df = df[df["blink"] == 0].copy()
     print(f"After blink filtering: {len(df):,} fixations")
 
-# Filter out very short fixations (< 80ms standard threshold to exclude microsaccades)
+# Filter out very short fixations (< 80ms)
 if "dur" in df.columns:
     df = df[pd.to_numeric(df["dur"], errors="coerce") >= MIN_FIXATION_DURATION].copy()
     print(f"After duration filtering (>= {MIN_FIXATION_DURATION}ms): {len(df):,} fixations")
@@ -75,7 +75,7 @@ sentences = pd.read_csv(SENTENCE_CSV)["sentence"].dropna()
 sentence_list = sentences.map(norm_text).tolist()
 
 # -----------------------------
-# MATCH SENTENCES (FAST CACHE)
+# MATCH SENTENCES
 # -----------------------------
 
 print("Matching sentences (fast)...")
@@ -112,7 +112,7 @@ df["uid"] = (
 )
 
 # -----------------------------
-# GROUP META TABLE (IMPORTANT)
+# GROUP META TABLE
 # -----------------------------
 
 meta = df.groupby("uid").first().reset_index()[["uid", "subid", "lang", "full_sentence"]]
@@ -163,14 +163,8 @@ for _, row in meta.iterrows():
 
     # TEST SET: Two conditions (inclusive OR)
     if (sentence in test_sentences) or (reader in test_readers):
-        # Include if:
-        # - ANY reader reading test sentences (all readers see new sentences)
-        # - OR test readers reading any sentence (test readers are completely new)
         test_uids.add(uid)
-    # TRAIN SET: Both conditions (both AND)
     elif (reader in train_readers) and (sentence in train_sentences):
-        # Include only if:
-        # - Train reader AND train sentence (guaranteed no leakage)
         train_uids.add(uid)
 
 print(f"\nFinal split:")

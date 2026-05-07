@@ -1,25 +1,3 @@
-"""
-COMPLETE EXPERIMENT RUNNER
-Runs ablations + evaluation and saves results to CSV for easy transport.
-
-Usage:
-  python run_experiment.py
-
-This will:
-1. Run all ablations (base, base_plus, hard_5, moe_5)
-2. Evaluate all models on test set
-3. Save comprehensive results to experiment_results.csv
-
-The CSV can be easily shared and analyzed.
-
-SCIENTIFIC DESIGN:
-- base: Minimal non-modular baseline (4.7M params)
-- base_plus: Parameter-matched non-modular (18.9M params)
-- hard_5: Language-family hard routing (18.9M params, 5 experts = 1 per family)
-- moe_5: Learned soft routing (18.9M params, 5 experts = 1 per family)
-
-"""
-
 import json
 import random
 import time
@@ -59,9 +37,9 @@ scaler = torch.amp.GradScaler("cuda", enabled=USE_AMP)
 
 ABLATIONS = {
     "base": ("base", 5),
-    "base_plus": ("base+", 5),      # Parameter-matched non-modular baseline
-    "hard_5": ("hard", 5),          # Hard routing: 1 expert per language family
-    "moe_5": ("moe", 5),            # MoE routing: learned expert selection
+    "base_plus": ("base+", 5),
+    "hard_5": ("hard", 5),
+    "moe_5": ("moe", 5),
 }
 
 

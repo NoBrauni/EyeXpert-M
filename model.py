@@ -121,7 +121,7 @@ class BaseDecoder(nn.Module):
 
 
 # =========================================================
-# BASE MODEL PLUS (parameter-matched with hard/moe)
+# BASE MODEL PLUS
 # =========================================================
 class BaseDecoderPlus(nn.Module):
     """Non-modular decoder with extra trainable layers to match hard/moe parameter count."""
@@ -177,7 +177,7 @@ class BaseDecoderPlus(nn.Module):
 
 
 # =========================================================
-# HARD ROUTING (true expert selection)
+# HARD ROUTING
 # =========================================================
 class HardDecoder(nn.Module):
     def __init__(self, hidden, n_experts):
@@ -225,7 +225,7 @@ class HardDecoder(nn.Module):
 
 
 # =========================================================
-# TRUE MoE (stable + measurable)
+# TRUE MoE
 # =========================================================
 class MoEDecoder(nn.Module):
     def __init__(self, hidden, n_experts):
