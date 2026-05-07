@@ -4,7 +4,6 @@ import numpy as np
 import csv
 from torch.utils.data import DataLoader
 from collections import defaultdict
-
 import torch.nn.functional as F
 
 from model import EyeXpertM
@@ -19,15 +18,9 @@ ABLATIONS = {
     "moe_5": ("moe", 5),
 }
 
-
 # -----------------------------
-# PER-SAMPLE METRICS
+# METRICS
 # -----------------------------
-def fixation_accuracy(pred, gold, mask):
-    correct = (pred == gold).float()
-    return (correct * mask).sum() / mask.sum()
-
-
 def levenshtein(a, b):
     n, m = len(a), len(b)
     dp = [[0] * (m + 1) for _ in range(n + 1)]
@@ -60,58 +53,23 @@ def regression_rate(seq):
     return (jumps < 0).float().mean().item()
 
 
-def evaluate_batch_detailed(pred, gold, mask, pred_dur, gold_dur):
-    B = pred.size(0)
-
-    acc = fixation_accuracy(pred, gold, mask)
-
-    lev_total = 0
-    reg_p = 0
-    reg_g = 0
-    exact_match = 0
-
-    for i in range(B):
-        L = int(mask[i].sum().item())
-
-        p = pred[i][:L].tolist()
-        g = gold[i][:L].tolist()
-
-        lev_total += normalized_levenshtein(p, g)
-        reg_p += regression_rate(p)
-        reg_g += regression_rate(g)
-
-        if p == g:
-            exact_match += 1
-
-    lev = lev_total / B
-    reg_p /= B
-    reg_g /= B
-    exact_match_rate = exact_match / B
-
-    # Duration metrics
-    pred_d = pred_dur.squeeze(-1)
-    gold_d = torch.log1p(gold_dur)
-    dur_mse = ((pred_d - gold_d) ** 2 * mask).sum() / mask.sum()
-    dur_mae = (torch.abs(pred_d - gold_d) * mask).sum() / mask.sum()
-
-    return {
-        "accuracy": acc.item(),
-        "levenshtein": lev,
-        "regression_pred": reg_p,
-        "regression_true": reg_g,
-        "exact_match": exact_match_rate,
-        "dur_mse": dur_mse.item(),
-        "dur_mae": dur_mae.item(),
-        "tokens": mask.sum().item()
-    }
+def compute_stats(values):
+    values = np.array(values)
+    mean = values.mean()
+    std = values.std()
+    ci95 = 1.96 * std / np.sqrt(len(values))
+    return mean, std, ci95
 
 
+# -----------------------------
+# PER-SAMPLE EVALUATION
+# -----------------------------
 def evaluate_detailed(model, loader):
-    """Detailed evaluation with all metrics."""
+    """
+    Returns per-sample metrics
+    """
     model.eval()
-
-    totals = None
-    total_tokens = 0
+    results = []
 
     with torch.no_grad():
         for batch in loader:
@@ -128,24 +86,50 @@ def evaluate_detailed(model, loader):
             )
 
             pred = logits.argmax(dim=-1)
-            metrics = evaluate_batch_detailed(pred, batch["scanpath"], batch["scanpath_mask"], dur_pred,
-                                              batch["durations"])
 
-            if totals is None:
-                totals = {k: 0.0 for k in metrics if k != "tokens"}
+            B = pred.size(0)
 
-            tokens = metrics["tokens"]
-            total_tokens += tokens
+            for i in range(B):
+                L = int(batch["scanpath_mask"][i].sum().item())
 
-            for k in totals:
-                totals[k] += metrics[k] * tokens
+                p = pred[i][:L].tolist()
+                g = batch["scanpath"][i][:L].tolist()
 
-    for k in totals:
-        totals[k] /= total_tokens
+                # fixation accuracy
+                acc = float(np.mean(np.array(p) == np.array(g)))
 
-    return totals
+                # scanpath similarity
+                lev = normalized_levenshtein(p, g)
+
+                # regression behavior
+                reg_p = regression_rate(p)
+                reg_g = regression_rate(g)
+
+                # duration error
+                pred_d = dur_pred[i][:L].squeeze(-1)
+                gold_d = torch.log1p(batch["durations"][i][:L])
+
+                dur_mse = F.mse_loss(pred_d, gold_d).item()
+                dur_mae = F.l1_loss(pred_d, gold_d).item()
+
+                exact = float(p == g)
+
+                results.append({
+                    "accuracy": acc,
+                    "levenshtein": lev,
+                    "regression_pred": reg_p,
+                    "regression_true": reg_g,
+                    "exact_match": exact,
+                    "dur_mse": dur_mse,
+                    "dur_mae": dur_mae
+                })
+
+    return results
 
 
+# -----------------------------
+# PER-LANGUAGE
+# -----------------------------
 def evaluate_per_language(model, loader):
     model.eval()
     family_stats = defaultdict(lambda: {"loss": 0.0, "count": 0})
@@ -164,7 +148,6 @@ def evaluate_per_language(model, loader):
                 batch["lang_id"]
             )
 
-            pred = logits.argmax(dim=-1)
             B, T, V = logits.shape
             mask = batch["scanpath_mask"].to(DEVICE)
 
@@ -178,64 +161,17 @@ def evaluate_per_language(model, loader):
             masked_count = mask.sum(dim=1)
 
             families = batch["family"].cpu().numpy()
+
             for b in range(B):
-                family_id = int(families[b])
-                family_stats[family_id]["loss"] += masked_loss[b].item()
-                family_stats[family_id]["count"] += masked_count[b].item()
+                fam = int(families[b])
+                family_stats[fam]["loss"] += masked_loss[b].item()
+                family_stats[fam]["count"] += masked_count[b].item()
 
-    family_results = {}
-    for family_id, stats in family_stats.items():
-        if stats["count"] > 0:
-            family_results[family_id] = stats["loss"] / stats["count"]
+    out = {}
+    for k, v in family_stats.items():
+        out[k] = v["loss"] / v["count"]
 
-    return family_results
-
-
-# -----------------------------
-# EVALUATE MODEL
-# -----------------------------
-def evaluate_model(model, loader):
-    model.eval()
-    all_results = []
-
-    with torch.no_grad():
-        for batch in loader:
-            batch = {k: v.to(DEVICE) if torch.is_tensor(v) else v for k, v in batch.items()}
-
-            logits, dur_pred, _ = model(
-                batch["input_ids"],
-                batch["attention_mask"],
-                batch["word_ids"],
-                batch["scanpath"],
-                batch["durations"],
-                batch["family"],
-                batch["lang_id"]
-            )
-
-            pred = logits.argmax(dim=-1)
-
-            results = evaluate_batch_detailed(
-                pred,
-                batch["scanpath"],
-                batch["scanpath_mask"],
-                dur_pred,
-                batch["durations"]
-            )
-
-            all_results.append(results)
-
-    return all_results
-
-
-# -----------------------------
-# STATS
-# -----------------------------
-def compute_stats(values):
-    values = np.array(values)
-    mean = values.mean()
-    std = values.std()
-    ci95 = 1.96 * std / np.sqrt(len(values))
-    return mean, std, ci95
+    return out
 
 
 # -----------------------------
@@ -244,7 +180,6 @@ def compute_stats(values):
 def main():
     print("Loading test data...")
     test_data = json.load(open("meco_test.json"))
-    test_data = test_data[:100]
     loader = DataLoader(MECO(test_data), batch_size=4, shuffle=False, collate_fn=collate)
 
     summary_rows = []
@@ -256,71 +191,65 @@ def main():
         model.load_state_dict(torch.load(f"{name}.pt", map_location=DEVICE))
         model.to(DEVICE)
 
-        # Test evaluation
-        detailed_metrics = evaluate_detailed(model, loader)
+        # FIXED: per-sample metrics
+        results = evaluate_detailed(model, loader)
 
-        # Per-language performance
-        family_performance = evaluate_per_language(model, loader)
+        def get(key):
+            return [r[key] for r in results]
 
-        # Compute stats for detailed metrics
-        acc_stats = compute_stats([detailed_metrics["accuracy"]])
-        lev_stats = compute_stats([detailed_metrics["levenshtein"]])
-        reg_pred_stats = compute_stats([detailed_metrics["regression_pred"]])
-        reg_true_stats = compute_stats([detailed_metrics["regression_true"]])
-        exact_match_stats = compute_stats([detailed_metrics["exact_match"]])
-        dur_mse_stats = compute_stats([detailed_metrics["dur_mse"]])
-        dur_mae_stats = compute_stats([detailed_metrics["dur_mae"]])
+        acc = compute_stats(get("accuracy"))
+        lev = compute_stats(get("levenshtein"))
+        reg_p = compute_stats(get("regression_pred"))
+        reg_g = compute_stats(get("regression_true"))
+        exact = compute_stats(get("exact_match"))
+        mse = compute_stats(get("dur_mse"))
+        mae = compute_stats(get("dur_mae"))
 
-        summary_rows.append({
+        family_perf = evaluate_per_language(model, loader)
+
+        row = {
             "model": name,
-            "accuracy_mean": acc_stats[0],
-            "accuracy_std": acc_stats[1],
-            "accuracy_ci95": acc_stats[2],
-            "levenshtein_mean": lev_stats[0],
-            "levenshtein_std": lev_stats[1],
-            "levenshtein_ci95": lev_stats[2],
-            "regression_pred_mean": reg_pred_stats[0],
-            "regression_pred_std": reg_pred_stats[1],
-            "regression_pred_ci95": reg_pred_stats[2],
-            "regression_true_mean": reg_true_stats[0],
-            "regression_true_std": reg_true_stats[1],
-            "regression_true_ci95": reg_true_stats[2],
-            "exact_match_mean": exact_match_stats[0],
-            "exact_match_std": exact_match_stats[1],
-            "exact_match_ci95": exact_match_stats[2],
-            "dur_mse_mean": dur_mse_stats[0],
-            "dur_mse_std": dur_mse_stats[1],
-            "dur_mse_ci95": dur_mse_stats[2],
-            "dur_mae_mean": dur_mae_stats[0],
-            "dur_mae_std": dur_mae_stats[1],
-            "dur_mae_ci95": dur_mae_stats[2],
-        })
 
-        # Add family performance
-        for family_id in range(5):
-            family_name = {0: "germanic", 1: "romance", 2: "north_germanic", 3: "slavic", 4: "finno_ugric"}.get(
-                family_id, f"family_{family_id}")
-            summary_rows[-1][f"{family_name}_loss"] = family_performance.get(family_id, float("nan"))
+            "accuracy_mean": acc[0],
+            "accuracy_std": acc[1],
+            "accuracy_ci95": acc[2],
 
-    # Save summary
-    fieldnames = [
-        "model",
-        "accuracy_mean", "accuracy_std", "accuracy_ci95",
-        "levenshtein_mean", "levenshtein_std", "levenshtein_ci95",
-        "regression_pred_mean", "regression_pred_std", "regression_pred_ci95",
-        "regression_true_mean", "regression_true_std", "regression_true_ci95",
-        "exact_match_mean", "exact_match_std", "exact_match_ci95",
-        "dur_mse_mean", "dur_mse_std", "dur_mse_ci95",
-        "dur_mae_mean", "dur_mae_std", "dur_mae_ci95",
-        "germanic_loss", "romance_loss", "north_germanic_loss", "slavic_loss", "finno_ugric_loss"
-    ]
+            "levenshtein_mean": lev[0],
+            "levenshtein_std": lev[1],
+            "levenshtein_ci95": lev[2],
+
+            "regression_pred_mean": reg_p[0],
+            "regression_true_mean": reg_g[0],
+
+            "exact_match_mean": exact[0],
+
+            "dur_mse_mean": mse[0],
+            "dur_mae_mean": mae[0],
+        }
+
+        fam_map = {
+            0: "germanic",
+            1: "romance",
+            2: "north_germanic",
+            3: "slavic",
+            4: "finno_ugric"
+        }
+
+        for k in range(5):
+            row[f"{fam_map[k]}_loss"] = family_perf.get(k, float("nan"))
+
+        summary_rows.append(row)
+
+    # save CSV
+    fieldnames = list(summary_rows[0].keys())
+
     with open("experiment_stats.csv", "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(summary_rows)
 
     print("\nDone!")
-    print("✔ Summary stats: experiment_stats.csv")
+    print("✔ Fixed, statistically valid results saved to experiment_stats.csv")
 
 
 if __name__ == "__main__":
